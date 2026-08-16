@@ -96,7 +96,7 @@ describe('WebhookStore', () => {
     const onReload = vi.fn()
     const reader = new WebhookStore(file, () => {})
     reader.load()
-    const dispose = reader.watch(onReload)
+    const dispose = reader.watch(onReload, 50)
     try {
       const writer = new WebhookStore(file, () => {})
       writer.load()
@@ -114,7 +114,7 @@ describe('WebhookStore', () => {
     const onReload = vi.fn()
     const store = new WebhookStore(file, () => {})
     store.load()
-    const dispose = store.watch(onReload)
+    const dispose = store.watch(onReload, 50)
     try {
       store.insertHook(makeHook(store.allocateId('wh'), 'self'))
       await new Promise(resolve => setTimeout(resolve, 250))
@@ -129,7 +129,7 @@ describe('WebhookStore', () => {
     const onReload = vi.fn()
     const reader = new WebhookStore(file, () => {})
     reader.load()
-    const dispose = reader.watch(onReload)
+    const dispose = reader.watch(onReload, 50)
     dispose()
 
     const writer = new WebhookStore(file, () => {})
@@ -145,7 +145,7 @@ describe('WebhookStore', () => {
     const reader = new WebhookStore(file, warn)
     reader.load()
     reader.insertHook(makeHook(reader.allocateId('wh'), 'mine'))
-    const dispose = reader.watch()
+    const dispose = reader.watch(undefined, 50)
     try {
       writeFileSync(file, 'not json')
       await new Promise(resolve => setTimeout(resolve, 250))

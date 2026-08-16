@@ -4,8 +4,8 @@
  * @module dsh-webhook/store
  */
 
-import { mkdirSync, readFileSync, renameSync, watch as fsWatch, writeFileSync, type FSWatcher } from 'node:fs'
-import { basename, dirname } from 'node:path'
+import { mkdirSync, readFileSync, renameSync, statSync, writeFileSync, type Stats } from 'node:fs'
+import { dirname } from 'node:path'
 
 /** HMAC-SHA256 signature check (GitHub-style `sha256=<hex>` header). */
 export interface HmacAuth {
@@ -161,9 +161,9 @@ export class WebhookStore {
   private hookList: WebhookHook[] = []
   private deliveryList: WebhookDelivery[] = []
   private callbackLogList: CallbackLogEntry[] = []
-  private watcher: FSWatcher | null = null
-  private debounce: ReturnType<typeof setTimeout> | null = null
+  private watcher: ReturnType<typeof setInterval> | null = null
   private lastWritten: string | null = null
+  private lastStat: { mtimeMs: number; size: number } | null = null
 
   constructor(
     private readonly filePath: string,
@@ -320,37 +320,46 @@ export class WebhookStore {
 
   /**
    * Watch the store file for external changes (another dsh process sharing
-   * this Harness home) and hot-reload the in-memory projection. Self-writes
-   * are recognized by content equality and skipped. Returns a disposer.
+   * this Harness home) and hot-reload the in-memory projection. Polling is
+   * used instead of `fs.watch`: libuv's fs-event on Windows aborts the
+   * process when the watched directory is deleted, which the tests' teardown
+   * (and a removed data dir in production) would trigger. Self-writes are
+   * recognized by content equality and skipped. Returns a disposer.
    * @param onReload - called once per applied external reload.
+   * @param intervalMs - poll interval; tests use a short one.
    */
-  watch(onReload?: (hooks: number) => void): () => void {
+  watch(onReload?: (hooks: number) => void, intervalMs = 500): () => void {
     if (this.watcher !== null) return () => {}
-    mkdirSync(dirname(this.filePath), { recursive: true })
-    const directory = dirname(this.filePath)
-    const name = basename(this.filePath)
-    const schedule = () => {
-      if (this.debounce !== null) clearTimeout(this.debounce)
-      this.debounce = setTimeout(() => {
-        this.debounce = null
-        if (this.reloadIfChanged() && onReload !== undefined) onReload(this.hookList.length)
-      }, 120)
-    }
-    const watcher = fsWatch(directory, (_eventType, filename) => {
-      if (String(filename) !== name && !String(filename).endsWith(`/${name}`)) return
-      schedule()
-    })
-    watcher.on('error', error => {
-      this.warn(`dsh-webhook: store watch failed: ${String(error)}`)
-      this.stopWatch()
-    })
-    this.watcher = watcher
+    const timer = setInterval(() => this.poll(onReload), intervalMs)
+    // Do not keep a one-shot headless process alive just for the watcher.
+    timer.unref()
+    this.watcher = timer
     return () => this.stopWatch()
+  }
+
+  /** One poll tick: reload when the file changed since our last sighting. */
+  private poll(onReload?: (hooks: number) => void): void {
+    if (this.watcher === null) return
+    let stat: Stats
+    try {
+      stat = statSync(this.filePath)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        this.lastStat = null
+        return
+      }
+      this.warn(`dsh-webhook: store watch stat failed: ${String(error)}`)
+      return
+    }
+    const sighting = { mtimeMs: stat.mtimeMs, size: stat.size }
+    if (this.lastStat !== null && this.lastStat.mtimeMs === sighting.mtimeMs && this.lastStat.size === sighting.size) return
+    this.lastStat = sighting
+    if (!this.reloadIfChanged()) return
+    if (onReload !== undefined) onReload(this.hookList.length)
   }
 
   /** Whether the file changed since our last write; reloads when it did. */
   private reloadIfChanged(): boolean {
-    if (this.watcher === null) return false
     let raw: string
     try {
       raw = readFileSync(this.filePath, 'utf8')
@@ -367,12 +376,8 @@ export class WebhookStore {
   }
 
   private stopWatch(): void {
-    if (this.debounce !== null) {
-      clearTimeout(this.debounce)
-      this.debounce = null
-    }
     if (this.watcher !== null) {
-      this.watcher.close()
+      clearInterval(this.watcher)
       this.watcher = null
     }
   }
