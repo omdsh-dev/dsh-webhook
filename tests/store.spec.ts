@@ -92,6 +92,75 @@ describe('WebhookStore', () => {
     expect(store.deliveries('wh-1')).toHaveLength(2)
   })
 
+  it('hot-reloads hooks and deliveries written by another process sharing the file', async () => {
+    const onReload = vi.fn()
+    const reader = new WebhookStore(file, () => {})
+    reader.load()
+    const dispose = reader.watch(onReload)
+    try {
+      const writer = new WebhookStore(file, () => {})
+      writer.load()
+      writer.insertHook(makeHook(writer.allocateId('wh'), 'ci'))
+      writer.appendDelivery(makeDelivery(writer.allocateId('dl'), 'wh-1'))
+      await vi.waitFor(() => expect(reader.hooks().map(hook => hook.name)).toEqual(['ci']))
+      expect(reader.deliveries('wh-1')).toHaveLength(1)
+      expect(onReload).toHaveBeenCalledWith(1)
+    } finally {
+      dispose()
+    }
+  })
+
+  it('skips its own writes: no reload fires for local mutations', async () => {
+    const onReload = vi.fn()
+    const store = new WebhookStore(file, () => {})
+    store.load()
+    const dispose = store.watch(onReload)
+    try {
+      store.insertHook(makeHook(store.allocateId('wh'), 'self'))
+      await new Promise(resolve => setTimeout(resolve, 250))
+      expect(store.hooks().map(hook => hook.name)).toEqual(['self'])
+      expect(onReload).not.toHaveBeenCalled()
+    } finally {
+      dispose()
+    }
+  })
+
+  it('stops watching after dispose', async () => {
+    const onReload = vi.fn()
+    const reader = new WebhookStore(file, () => {})
+    reader.load()
+    const dispose = reader.watch(onReload)
+    dispose()
+
+    const writer = new WebhookStore(file, () => {})
+    writer.load()
+    writer.insertHook(makeHook(writer.allocateId('wh'), 'late'))
+    await new Promise(resolve => setTimeout(resolve, 250))
+    expect(reader.hooks()).toEqual([])
+    expect(onReload).not.toHaveBeenCalled()
+  })
+
+  it('keeps current state when an external write is corrupt or unsupported', async () => {
+    const warn = vi.fn()
+    const reader = new WebhookStore(file, warn)
+    reader.load()
+    reader.insertHook(makeHook(reader.allocateId('wh'), 'mine'))
+    const dispose = reader.watch()
+    try {
+      writeFileSync(file, 'not json')
+      await new Promise(resolve => setTimeout(resolve, 250))
+      expect(reader.hooks().map(hook => hook.name)).toEqual(['mine'])
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('corrupt'))
+
+      writeFileSync(file, JSON.stringify({ version: 99, hooks: [], deliveries: [] }))
+      await new Promise(resolve => setTimeout(resolve, 250))
+      expect(reader.hooks().map(hook => hook.name)).toEqual(['mine'])
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('unsupported store format'))
+    } finally {
+      dispose()
+    }
+  })
+
   it('quarantines a corrupt store instead of failing', () => {
     const warn = vi.fn()
     writeFileSync(file, 'not json')

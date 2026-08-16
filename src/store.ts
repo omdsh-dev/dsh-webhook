@@ -4,8 +4,8 @@
  * @module dsh-webhook/store
  */
 
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
-import { dirname } from 'node:path'
+import { mkdirSync, readFileSync, renameSync, watch as fsWatch, writeFileSync, type FSWatcher } from 'node:fs'
+import { basename, dirname } from 'node:path'
 
 /** HMAC-SHA256 signature check (GitHub-style `sha256=<hex>` header). */
 export interface HmacAuth {
@@ -161,6 +161,9 @@ export class WebhookStore {
   private hookList: WebhookHook[] = []
   private deliveryList: WebhookDelivery[] = []
   private callbackLogList: CallbackLogEntry[] = []
+  private watcher: FSWatcher | null = null
+  private debounce: ReturnType<typeof setTimeout> | null = null
+  private lastWritten: string | null = null
 
   constructor(
     private readonly filePath: string,
@@ -176,6 +179,16 @@ export class WebhookStore {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
       throw error
     }
+    this.lastWritten = raw
+    this.applyRaw(raw, false)
+  }
+
+  /**
+   * Replace the in-memory projection with the given file content. Hot reloads
+   * (external writes from another process sharing this store) degrade to a
+   * warning on an unsupported format instead of failing the host boot.
+   */
+  private applyRaw(raw: string, hot: boolean): void {
     let parsed: unknown
     try {
       parsed = JSON.parse(raw)
@@ -187,6 +200,10 @@ export class WebhookStore {
     }
     if (!isRecord(parsed) || parsed.version !== STORE_VERSION
       || !Array.isArray(parsed.hooks) || !Array.isArray(parsed.deliveries)) {
+      if (hot) {
+        this.warn(`dsh-webhook: unsupported store format in ${this.filePath}; keeping current state`)
+        return
+      }
       throw new Error(`dsh-webhook: unsupported store format in ${this.filePath}`)
     }
     const hooks: WebhookHook[] = []
@@ -301,6 +318,65 @@ export class WebhookStore {
     this.persist()
   }
 
+  /**
+   * Watch the store file for external changes (another dsh process sharing
+   * this Harness home) and hot-reload the in-memory projection. Self-writes
+   * are recognized by content equality and skipped. Returns a disposer.
+   * @param onReload - called once per applied external reload.
+   */
+  watch(onReload?: (hooks: number) => void): () => void {
+    if (this.watcher !== null) return () => {}
+    mkdirSync(dirname(this.filePath), { recursive: true })
+    const directory = dirname(this.filePath)
+    const name = basename(this.filePath)
+    const schedule = () => {
+      if (this.debounce !== null) clearTimeout(this.debounce)
+      this.debounce = setTimeout(() => {
+        this.debounce = null
+        if (this.reloadIfChanged() && onReload !== undefined) onReload(this.hookList.length)
+      }, 120)
+    }
+    const watcher = fsWatch(directory, (_eventType, filename) => {
+      if (String(filename) !== name && !String(filename).endsWith(`/${name}`)) return
+      schedule()
+    })
+    watcher.on('error', error => {
+      this.warn(`dsh-webhook: store watch failed: ${String(error)}`)
+      this.stopWatch()
+    })
+    this.watcher = watcher
+    return () => this.stopWatch()
+  }
+
+  /** Whether the file changed since our last write; reloads when it did. */
+  private reloadIfChanged(): boolean {
+    if (this.watcher === null) return false
+    let raw: string
+    try {
+      raw = readFileSync(this.filePath, 'utf8')
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        this.warn(`dsh-webhook: store watch read failed: ${String(error)}`)
+      }
+      return false
+    }
+    if (raw === this.lastWritten) return false
+    this.lastWritten = raw
+    this.applyRaw(raw, true)
+    return true
+  }
+
+  private stopWatch(): void {
+    if (this.debounce !== null) {
+      clearTimeout(this.debounce)
+      this.debounce = null
+    }
+    if (this.watcher !== null) {
+      this.watcher.close()
+      this.watcher = null
+    }
+  }
+
   private persist(): void {
     mkdirSync(dirname(this.filePath), { recursive: true })
     const payload = JSON.stringify({
@@ -310,8 +386,10 @@ export class WebhookStore {
       deliveries: this.deliveryList,
       callbacks: this.callbackLogList,
     }, null, 2)
+    const content = `${payload}\n`
+    this.lastWritten = content
     const temporary = `${this.filePath}.tmp-${process.pid}`
-    writeFileSync(temporary, `${payload}\n`)
+    writeFileSync(temporary, content)
     renameSync(temporary, this.filePath)
   }
 }

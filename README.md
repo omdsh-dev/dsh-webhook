@@ -138,10 +138,16 @@ The payload arrives as a bounded `<raw_payload_excerpt>` block; payload content 
 | `hooks` | `[]` | Static hook definitions: `name`, `promptTemplate`, `authKind`, `secretRef`, `header`, `target`, `paused`, `callbacks` |
 | `callbacks` | `[]` | Global callback rules: `source`, `statuses`, `outcomes`, `target`, `secretRef` |
 
+Hooks, deliveries, and callback history written by another dsh process sharing the same Harness home are picked up live: `store.json` is file-watched (self-writes are recognized and skipped), so a hook registered in a headless run is served by a running `dsh web` without a restart.
+
+## Deployment
+
+The server is plain HTTP by design; TLS is terminated upstream. For a public endpoint, put a reverse proxy (Caddy / nginx / Cloudflare Tunnel) in front and keep `bind: 127.0.0.1` — the proxy terminates TLS and forwards to the loopback listener. A public bind (`0.0.0.0`) is supported but refuses secret-less hooks and still carries plaintext, so it is only appropriate behind a network-level guard on the same host.
+
 ## Known limitations
 
 - The `none` auth profile accepts loopback sources only; anything else needs a `secretRef`.
-- Callback delivery is a single attempt with a timeout — no retry, no queue, no outbound receipts for the callback itself (v0.3: exponential backoff and vendor presets).
+- Callback delivery is a single attempt with a timeout — no retry, no queue, no outbound receipts for the callback itself (planned: exponential backoff and vendor presets).
 - Replay is unavailable for events whose original body exceeded the stored-payload bound.
 - Outcome tracking watches one pending run per session; back-to-back events into the same session supersede the earlier watch.
 - Events are at-least-once within one host run: a crash between message enqueue and store flush can repeat a delivery.

@@ -213,6 +213,9 @@ export function apply(ctx: Context, config: Config): void {
   ctx.inject(['commands'], (commandCtx) => {
     commandCtx.effect(() => registerWebhookCommand(commandCtx, engine), 'dsh-webhook: command')
   })
+  ctx.effect(() => store.watch(hooks => {
+    runtime.info(`dsh-webhook: store reloaded (${hooks} hook(s))`)
+  }), 'dsh-webhook: store watch')
   ctx.effect(() => {
     let lock = acquireListenerLock(dataDir, message => runtime.warn(message))
     let retry: ReturnType<typeof setInterval> | null = null
