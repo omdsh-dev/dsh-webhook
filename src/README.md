@@ -13,7 +13,8 @@ The baseline source entries are:
 - `src/coldwake.ts`: cold-session resume behind the `coldWake` config;
 - `src/lock.ts`: the single-instance listener lock for shared Harness homes;
 - `src/tracking.ts`: turn-outcome tracking that writes receipts back onto deliveries;
-- `src/tools.ts`: the `webhook_add` / `webhook_list` / `webhook_remove` / `webhook_deliveries` / `webhook_replay` model tools;
+- `src/callbacks.ts`: outbound callback fan-out (HTTP POST with optional bearer, macOS notification) and the `ctx.callbacks` service for other plugins;
+- `src/tools.ts`: the `webhook_add` / `webhook_list` / `webhook_remove` / `webhook_deliveries` / `webhook_replay` / `webhook_pause` / `webhook_resume` / `webhook_callbacks` model tools;
 - `src/command.ts`: the `/webhook` human command.
 
 Keep the baseline files focused. Extend `src/config.ts` rather than hiding deployment choices in implementation constants; extend `src/runtime.ts` with fakeable process, clock, transport, or UI boundaries.

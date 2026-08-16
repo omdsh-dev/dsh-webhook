@@ -43,8 +43,10 @@ Model-facing tools, registered globally in every agent:
 - `webhook_add` — register an endpoint at `POST /hooks/<name>` with a `prompt_template` (`{{payload.path}}` and `{{header.name}}` interpolate), an `auth_kind`, and a `secret_ref`. Returns the full URL to paste into the external system.
 - `webhook_list` — every hook with its auth profile, target, and delivery counts.
 - `webhook_remove` — remove a hook and its history.
+- `webhook_pause` / `webhook_resume` — refuse requests temporarily (`403` to the sender) without removing the hook; state survives restarts.
 - `webhook_deliveries` — recent receipts: status, event id, outcome, and a result excerpt.
 - `webhook_replay` — re-deliver a recorded event through the normal path; the killer tool for debugging a fixed template.
+- `webhook_callbacks` — recent outbound callback attempts: target, status, and failure reasons.
 
 The same store from the human side:
 
@@ -53,6 +55,9 @@ The same store from the human side:
 /webhook add github-ci "An event {{header.x-github-event}} arrived for {{payload.repository.full_name}}; act on it" auth=hmac-sha256 secret=E2E_SECRET
 /webhook deliveries github-ci
 /webhook replay dl-2
+/webhook pause github-ci
+/webhook resume github-ci
+/webhook callbacks 20
 /webhook remove github-ci
 ```
 
@@ -69,6 +74,28 @@ Every hook declares one of three auth profiles; secrets are **never stored in th
 Request handling is honest: wrong signature → `401`, loopback-only hook hit off-loopback → `403`, unknown hook → `404`, per-hook rate budget exceeded → `429`, body over `maxPayloadBytes` → `413`. A request is acknowledged only after verification, so senders see real status codes. Accepted events are processed asynchronously with an immediate `200`.
 
 A public bind (`0.0.0.0`) refuses secret-less hooks at load and at add time — a public listener without credentials is a misconfiguration, not a feature.
+
+## Callbacks
+
+Every settled delivery — `delivered` with an outcome, or `held` without a target — fans out to every matching callback rule: a global rule from the `callbacks` config, plus the hook's own `callbacks`. Any plugin can emit through the `callbacks` service (`ctx.callbacks.emit(...)`); dsh-cron, when installed alongside, emits each settled job run. Each attempt is recorded on a bounded log and, for webhook events, on the originating delivery as `lastCallback`.
+
+Targets:
+
+- `https://…` — POST with the event as JSON; optional `secretRef` adds `Authorization: Bearer <resolved>`. Single attempt with a 10 s timeout; no retry in v0.2 (a failure is recorded, not retried).
+- `local://macos-notification` — a macOS notification (`display notification`) with the subject and result excerpt.
+
+Rules filter by `source` (`webhook` | `cron`), delivery `statuses`, and task `outcomes`; absent filters match anything. Fire-and-forget by design: a callback failure never blocks delivery settling.
+
+```yaml
+callbacks:
+  - source: webhook        # only webhook events
+    outcomes: [error]      # …and only failures
+    target: https://hooks.example.com/alert
+    secretRef: ALERT_TOKEN
+  - target: local://macos-notification   # everything, on this machine
+```
+
+Callbacks for cron events are opt-in at the cron side by simply installing both plugins and declaring rules — cron stays independent of the webhook package and degrades silently without it.
 
 ## Receipts, deduplication, replay
 
@@ -108,11 +135,13 @@ The payload arrives as a bounded `<raw_payload_excerpt>` block; payload content 
 | `busyDelivery` | `followup` | Busy-target delivery: `followup` queues the task as the next turn; `inject` rides the running turn as context |
 | `coldWake` | `false` | Resume a cold creating session so the event executes with no live session |
 | `dataDir` | Harness-home `webhook` directory | Directory holding `store.json` (atomic writes; a corrupt file is quarantined aside) |
-| `hooks` | `[]` | Static hook definitions: `name`, `promptTemplate`, `authKind`, `secretRef`, `header`, `target` |
+| `hooks` | `[]` | Static hook definitions: `name`, `promptTemplate`, `authKind`, `secretRef`, `header`, `target`, `paused`, `callbacks` |
+| `callbacks` | `[]` | Global callback rules: `source`, `statuses`, `outcomes`, `target`, `secretRef` |
 
 ## Known limitations
 
 - The `none` auth profile accepts loopback sources only; anything else needs a `secretRef`.
+- Callback delivery is a single attempt with a timeout — no retry, no queue, no outbound receipts for the callback itself (v0.3: exponential backoff and vendor presets).
 - Replay is unavailable for events whose original body exceeded the stored-payload bound.
 - Outcome tracking watches one pending run per session; back-to-back events into the same session supersede the earlier watch.
 - Events are at-least-once within one host run: a crash between message enqueue and store flush can repeat a delivery.

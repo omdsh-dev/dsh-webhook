@@ -8,6 +8,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 import { createUserMessage, type UserMessage } from '@deepseek-ai/dsh-llm'
+import { deliveryCallbackEvent, CallbackDispatcher, type CallbackEvent } from './callbacks.ts'
 import { wakeColdSession } from './coldwake.ts'
 import { registerWebhookCommand } from './command.ts'
 import { isPublicBind, resolveConfig, type Config, type ResolvedConfig } from './config.ts'
@@ -101,12 +102,33 @@ export function apply(ctx: Context, config: Config): void {
   const dataDir = resolved.dataDir ?? join(resolveDshHome(), 'webhook')
   const store = new WebhookStore(join(dataDir, 'store.json'), message => runtime.warn(message))
   store.load()
+  const dispatcher = new CallbackDispatcher({
+    store,
+    now: () => runtime.now(),
+    resolveSecret: ref => runtime.resolveSecret(ref),
+    warn: message => runtime.warn(message),
+    info: message => runtime.info(message),
+    onAttempt: (deliveryId, attempt) => {
+      const delivery = store.deliveryById(deliveryId)
+      if (delivery === undefined) return
+      delivery.lastCallback = attempt
+      store.flush()
+    },
+  })
+  const emitCallbacks = (event: CallbackEvent, hookTargets: readonly { target: string; secretRef?: string; statuses?: readonly string[]; outcomes?: readonly string[] }[] = []) => {
+    dispatcher.emit(event, resolved.callbacks, hookTargets)
+  }
   const tracker = createOutcomeTracker(ctx, (deliveryId, run) => {
     const delivery = store.deliveryById(deliveryId)
     if (delivery === undefined) return
     delivery.outcome = run.outcome
     if (run.excerpt !== undefined) delivery.excerpt = run.excerpt
     store.flush()
+    const hook = delivery.hookId === undefined ? undefined : store.hookById(delivery.hookId)
+    const subject = hook === undefined
+      ? `${delivery.id} ${delivery.outcome}`
+      : `${hook.name} · ${delivery.id} ${delivery.outcome}`
+    emitCallbacks(deliveryCallbackEvent(delivery, subject, run.completedAt), hook?.callbacks ?? [])
   })
   const engine = new WebhookEngine({
     store,
@@ -117,6 +139,11 @@ export function apply(ctx: Context, config: Config): void {
     deliver: (target, message) => runtime.deliver(target, message),
     onDelivered: (deliveryId, target) => {
       tracker.track(deliveryId, target.id)
+    },
+    onHeld: delivery => {
+      const hook = delivery.hookId === undefined ? undefined : store.hookById(delivery.hookId)
+      const subject = hook === undefined ? delivery.id : `${hook.name} · ${delivery.id} held`
+      emitCallbacks(deliveryCallbackEvent(delivery, subject), hook?.callbacks ?? [])
     },
     ...(resolved.coldWake
       ? {
@@ -163,6 +190,8 @@ export function apply(ctx: Context, config: Config): void {
             : { kind: 'hmac-sha256', secretRef: hook.secretRef as string, ...(hook.header === undefined ? {} : { header: hook.header }) },
         ...(hook.target === undefined || hook.target === null ? {} : { target: hook.target }),
         createdBy: null,
+        ...(hook.paused === undefined ? {} : { paused: hook.paused }),
+        ...(hook.callbacks === undefined || hook.callbacks.length === 0 ? {} : { callbacks: hook.callbacks }),
       })
     } catch (error) {
       if ((error as Error).message.includes('already exists')) {
@@ -174,6 +203,11 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   ctx.provide('webhook', engine.service())
+  ctx.provide('callbacks', {
+    emit: (event: CallbackEvent) => {
+      emitCallbacks(event)
+    },
+  })
   ctx.on('agent/created', () => { /* targets are read lazily per delivery */ })
   registerWebhookTools(ctx, engine)
   ctx.inject(['commands'], (commandCtx) => {

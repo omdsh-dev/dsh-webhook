@@ -31,11 +31,23 @@ export interface NoneAuth {
 
 export type HookAuth = HmacAuth | TokenAuth | NoneAuth
 
+/** Outbound notification rule attached to a hook or declared globally. */
+export interface CallbackTarget {
+  /** `http(s)://...` POST target or `local://macos-notification`. */
+  readonly target: string
+  /** Credential reference for the `Authorization: Bearer` header. */
+  readonly secretRef?: string
+  /** Delivery-status filter; absent matches any status. */
+  readonly statuses?: readonly string[]
+  /** Outcome filter; absent matches any outcome. */
+  readonly outcomes?: readonly string[]
+}
+
 /** One registered webhook endpoint. */
 export interface WebhookHook {
   /** Stable store-local id, never reused within one store file. */
   readonly id: string
-  /** URL slug: the endpoint is `POST /hooks/<name>`. */
+  /** URL slug; the endpoint is `POST /hooks/<name>`. */
   readonly name: string
   /** Prompt template; `{{payload.path}}` and `{{header.name}}` interpolate. */
   readonly promptTemplate: string
@@ -46,6 +58,10 @@ export interface WebhookHook {
   readonly createdAt: string
   deliveryCount: number
   lastDeliveryAt: string | null
+  /** Requests are refused while paused. */
+  paused: boolean
+  /** Hook-level outbound callbacks fired on settle; absent means none. */
+  callbacks?: readonly CallbackTarget[]
 }
 
 /** One recorded delivery attempt. */
@@ -66,12 +82,33 @@ export interface WebhookDelivery {
   readonly payloadExcerpt: string
   outcome?: 'completed' | 'error' | 'cancelled' | 'timeout'
   excerpt?: string
+  /** Result of the last outbound callback attempt for this delivery. */
+  lastCallback?: {
+    readonly target: string
+    readonly status: 'sent' | 'failed'
+    readonly sentAt: string
+    readonly error?: string
+  }
+}
+
+/** One recorded outbound callback attempt. */
+export interface CallbackLogEntry {
+  readonly id: string
+  readonly source: 'webhook' | 'cron'
+  readonly subject: string
+  readonly target: string
+  readonly status: 'sent' | 'failed'
+  readonly error?: string
+  readonly sentAt: string
 }
 
 const STORE_VERSION = 1
 
 /** Deliveries retained per hook. */
 const MAX_DELIVERIES_PER_HOOK = 50
+
+/** Outbound callback attempts retained globally. */
+const MAX_CALLBACK_LOG = 100
 
 /** Raw bodies retained for replay. */
 const MAX_STORED_PAYLOAD_BYTES = 8_192
@@ -88,6 +125,7 @@ function isValidHook(value: unknown): value is WebhookHook {
   if (value.createdBy !== null && typeof value.createdBy !== 'string') return false
   if (typeof value.deliveryCount !== 'number') return false
   if (value.lastDeliveryAt !== null && typeof value.lastDeliveryAt !== 'string') return false
+  if (value.paused !== undefined && typeof value.paused !== 'boolean') return false
   const auth = value.auth
   if (!isRecord(auth)) return false
   if (auth.kind === 'none') return true
@@ -105,6 +143,15 @@ function isValidDelivery(value: unknown): value is WebhookDelivery {
     || value.status === 'delivered' || value.status === 'held'
 }
 
+function isValidCallbackEntry(value: unknown): value is CallbackLogEntry {
+  if (!isRecord(value)) return false
+  if (typeof value.id !== 'string' || typeof value.subject !== 'string') return false
+  if (typeof value.target !== 'string' || typeof value.sentAt !== 'string') return false
+  if (value.source !== 'webhook' && value.source !== 'cron') return false
+  if (value.status !== 'sent' && value.status !== 'failed') return false
+  return value.error === undefined || typeof value.error === 'string'
+}
+
 /**
  * JSON-file store for hooks and deliveries. Writes are atomic; a corrupt file
  * is quarantined aside instead of breaking the host boot.
@@ -113,6 +160,7 @@ export class WebhookStore {
   private seq = 0
   private hookList: WebhookHook[] = []
   private deliveryList: WebhookDelivery[] = []
+  private callbackLogList: CallbackLogEntry[] = []
 
   constructor(
     private readonly filePath: string,
@@ -149,10 +197,13 @@ export class WebhookStore {
         continue
       }
       ids.add(entry.id)
-      hooks.push(entry)
+      hooks.push({ ...entry, paused: entry.paused ?? false })
     }
     this.hookList = hooks
     this.deliveryList = parsed.deliveries.filter((entry: unknown) => isValidDelivery(entry))
+    this.callbackLogList = Array.isArray(parsed.callbacks)
+      ? parsed.callbacks.filter((entry: unknown) => isValidCallbackEntry(entry))
+      : []
     this.seq = typeof parsed.seq === 'number' && Number.isSafeInteger(parsed.seq) ? parsed.seq : hooks.length
   }
 
@@ -222,6 +273,29 @@ export class WebhookStore {
     this.persist()
   }
 
+  /** Set a hook's paused state; returns false when unknown. */
+  setPaused(id: string, paused: boolean): boolean {
+    const hook = this.hookList.find(candidate => candidate.id === id)
+    if (hook === undefined) return false
+    hook.paused = paused
+    this.persist()
+    return true
+  }
+
+  /** Outbound callback attempts, newest first, bounded to the log cap. */
+  callbackLogs(limit = MAX_CALLBACK_LOG): readonly CallbackLogEntry[] {
+    return this.callbackLogList.slice(-limit).reverse()
+  }
+
+  /** Append one outbound callback attempt, trimming to the log cap. */
+  appendCallbackLog(entry: CallbackLogEntry): void {
+    this.callbackLogList.push(entry)
+    if (this.callbackLogList.length > MAX_CALLBACK_LOG) {
+      this.callbackLogList = this.callbackLogList.slice(-MAX_CALLBACK_LOG)
+    }
+    this.persist()
+  }
+
   /** Persist after an in-place record mutation. */
   flush(): void {
     this.persist()
@@ -234,6 +308,7 @@ export class WebhookStore {
       seq: this.seq,
       hooks: this.hookList,
       deliveries: this.deliveryList,
+      callbacks: this.callbackLogList,
     }, null, 2)
     const temporary = `${this.filePath}.tmp-${process.pid}`
     writeFileSync(temporary, `${payload}\n`)

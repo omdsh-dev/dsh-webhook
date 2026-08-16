@@ -6,6 +6,7 @@
  */
 
 import { isIP } from 'node:net'
+import type { CallbackTarget, CallbackLogEntry } from './store.ts'
 import type { InboundEvent, VerifyResult } from './server.ts'
 import { verifyRequest } from './sign.ts'
 import { buildPrompt } from './template.ts'
@@ -37,6 +38,10 @@ export interface AddHookInput {
   readonly target?: string | null
   /** Creating session id, preferred at delivery when no explicit target. */
   readonly createdBy?: string | null
+  /** Requests are refused while paused. */
+  readonly paused?: boolean
+  /** Hook-level outbound callbacks fired when a delivery settles. */
+  readonly callbacks?: readonly CallbackTarget[]
 }
 
 export interface AddHookResult {
@@ -81,6 +86,8 @@ export interface WebhookEngineOptions {
   deliver(target: WebhookTarget, message: unknown): void
   /** Called after a successful delivery so the host can track the turn. */
   readonly onDelivered?: ((deliveryId: string, target: WebhookTarget) => void) | undefined
+  /** Called when a delivery settles without a target so the host can notify. */
+  readonly onHeld?: ((delivery: WebhookDelivery) => void) | undefined
   /**
    * Wake a hook's cold creating session and return it as a target, or null to
    * leave the event held. Absent disables cold wake entirely.
@@ -99,6 +106,12 @@ export interface WebhookService {
   list(): readonly WebhookHook[]
   deliveries(name: string): readonly WebhookDelivery[]
   replay(deliveryId: string): Promise<ReplayResult>
+  /** Refuse requests to a hook; returns false when unknown. */
+  pause(name: string): boolean
+  /** Accept requests to a hook again; returns false when unknown. */
+  resume(name: string): boolean
+  /** Outbound callback attempts, newest first. */
+  callbacks(limit?: number): readonly CallbackLogEntry[]
 }
 
 /**
@@ -119,6 +132,15 @@ export class WebhookEngine {
         return hook === undefined ? [] : this.options.store.deliveries(hook.id)
       },
       replay: id => this.replay(id),
+      pause: name => {
+        const hook = this.options.store.hookByName(name)
+        return hook === undefined ? false : this.options.store.setPaused(hook.id, true)
+      },
+      resume: name => {
+        const hook = this.options.store.hookByName(name)
+        return hook === undefined ? false : this.options.store.setPaused(hook.id, false)
+      },
+      callbacks: (limit = 20) => this.options.store.callbackLogs(limit),
     }
   }
 
@@ -158,6 +180,8 @@ export class WebhookEngine {
       createdAt: now,
       deliveryCount: 0,
       lastDeliveryAt: null,
+      paused: input.paused ?? false,
+      ...(input.callbacks === undefined || input.callbacks.length === 0 ? {} : { callbacks: input.callbacks }),
     }
     this.options.store.insertHook(hook)
     return { hook, url: `/hooks/${name}` }
@@ -177,6 +201,7 @@ export class WebhookEngine {
   async verify(event: InboundEvent): Promise<VerifyResult> {
     const hook = this.options.store.hookByName(event.hookName)
     if (hook === undefined) return { ok: false, code: 404, reason: 'unknown hook' }
+    if (hook.paused) return { ok: false, code: 403, reason: 'hook is paused' }
     if (hook.auth.kind === 'none' && !sourceAllowed(event.sourceIp)) {
       return { ok: false, code: 403, reason: 'this hook is loopback-only' }
     }
@@ -217,6 +242,7 @@ export class WebhookEngine {
     delivery.status = 'held'
     delivery.reason = 'no delivery target was available'
     this.options.store.flush()
+    this.options.onHeld?.(delivery)
     this.options.warn?.(`dsh-webhook: event ${delivery.id} held: no target for ${hook.name}`)
   }
 
@@ -255,6 +281,7 @@ export class WebhookEngine {
     replay.status = 'held'
     replay.reason = 'no delivery target was available'
     this.options.store.flush()
+    this.options.onHeld?.(replay)
     return { delivered: false, reason: 'no delivery target was available', deliveryId: replay.id }
   }
 

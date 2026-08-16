@@ -36,15 +36,18 @@ describe('dsh-webhook', () => {
     expect(typeof unwrapped.apply).toBe('function')
   })
 
-  it('registers the five webhook tools and unprovides the service on dispose', async () => {
+  it('registers the eight webhook tools and unprovides the services on dispose', async () => {
     const harness = await createPluginHarness()
     expect(harness.registered.map(tool => tool.name)).toEqual([
       'webhook_add', 'webhook_list', 'webhook_remove', 'webhook_deliveries', 'webhook_replay',
+      'webhook_pause', 'webhook_resume', 'webhook_callbacks',
     ])
     expect(harness.ctx.get('webhook')).toBeDefined()
+    expect(harness.ctx.get('callbacks')).toBeDefined()
 
     await harness.dispose()
     expect(harness.ctx.get('webhook')).toBeUndefined()
+    expect(harness.ctx.get('callbacks')).toBeUndefined()
   })
 
   it('adds, lists, and removes a hook through the tools', async () => {

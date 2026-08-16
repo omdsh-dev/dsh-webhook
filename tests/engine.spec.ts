@@ -105,6 +105,16 @@ describe('WebhookEngine', () => {
     expect(result).toEqual({ ok: false, code: 403, reason: 'this hook is loopback-only' })
   })
 
+  it('refuses requests to a paused hook and resumes it', async () => {
+    harness.engine.addHook({ name: 'ci', promptTemplate: 'act', auth: { kind: 'none' } })
+    expect(harness.engine.service().pause('ci')).toBe(true)
+    expect(harness.engine.service().pause('missing')).toBe(false)
+    const paused = await harness.engine.verify(makeEvent('ci'))
+    expect(paused).toEqual({ ok: false, code: 403, reason: 'hook is paused' })
+    expect(harness.engine.service().resume('ci')).toBe(true)
+    expect((await harness.engine.verify(makeEvent('ci'))).ok).toBe(true)
+  })
+
   it('accepts a verified event, delivers, and records a receipt with outcome-ready state', async () => {
     harness.engine.addHook({ name: 'ci', promptTemplate: 'act on {{payload.action}}', auth: { kind: 'none' } })
     await harness.engine.accept(makeEvent('ci'))

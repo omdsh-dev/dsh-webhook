@@ -13,7 +13,10 @@ const USAGE = [
   '  /webhook list',
   '  /webhook add <name> <prompt...>  [auth=hmac|bearer|none] [secret=<ref>] [header=<name>]',
   '  /webhook remove <name>',
+  '  /webhook pause <name>',
+  '  /webhook resume <name>',
   '  /webhook deliveries <name>',
+  '  /webhook callbacks [limit]',
   '  /webhook replay <delivery-id>',
 ].join('\n')
 
@@ -23,7 +26,8 @@ function formatHook(hook: WebhookHook): string {
     : `${hook.auth.kind} ${hook.auth.secretRef}${hook.auth.header !== undefined ? ` (${hook.auth.header})` : ''}`
   const target = hook.target === null ? '' : `  target ${hook.target}`
   const last = hook.lastDeliveryAt === null ? '' : `  last ${hook.lastDeliveryAt}`
-  return `${hook.name}  ${auth}  deliveries ${hook.deliveryCount}${last}${target}  ${hook.promptTemplate}`
+  const state = hook.paused ? '  PAUSED' : ''
+  return `${hook.name}${state}  ${auth}  deliveries ${hook.deliveryCount}${last}${target}  ${hook.promptTemplate}`
 }
 
 /**
@@ -67,6 +71,27 @@ export function registerWebhookCommand(ctx: Context, engine: WebhookEngine): () 
           if (!result.delivered) ctx.logger.warn(`dsh-webhook: replay of ${id} not delivered: ${result.reason ?? 'unknown'}`)
         })
         return { kind: 'success', text: `Replay of ${id} started.` }
+      }
+      if (input.startsWith('pause ')) {
+        const name = input.slice('pause '.length).trim()
+        if (name.length === 0) return { kind: 'error', text: USAGE }
+        return engine.service().pause(name)
+          ? { kind: 'success', text: `Paused ${name}: requests now return 403.` }
+          : { kind: 'error', text: `No such hook: ${name}` }
+      }
+      if (input.startsWith('resume ')) {
+        const name = input.slice('resume '.length).trim()
+        if (name.length === 0) return { kind: 'error', text: USAGE }
+        return engine.service().resume(name)
+          ? { kind: 'success', text: `Resumed ${name}.` }
+          : { kind: 'error', text: `No such hook: ${name}` }
+      }
+      if (input.startsWith('callbacks')) {
+        const limitText = input.slice('callbacks'.length).trim()
+        const limit = limitText.length === 0 ? 20 : Math.max(1, Math.min(100, Number(limitText)))
+        const entries = engine.service().callbacks(Number.isNaN(limit) ? 20 : limit)
+        if (entries.length === 0) return { kind: 'success', text: 'No callback attempts recorded.' }
+        return { kind: 'success', text: entries.map(formatCallback).join('\n') }
       }
       if (input.startsWith('add ')) {
         const tokens = input.slice('add '.length).trim().split(/\s+/)
@@ -118,4 +143,17 @@ function formatDelivery(delivery: {
   const outcome = delivery.outcome === undefined ? '' : `  outcome ${delivery.outcome}`
   const excerpt = delivery.excerpt === undefined ? '' : `  …${delivery.excerpt}`
   return `${delivery.id}  ${delivery.status}${event}${reason}${outcome}${excerpt}  ${delivery.receivedAt}`
+}
+
+function formatCallback(entry: {
+  readonly id: string
+  readonly source: string
+  readonly subject: string
+  readonly target: string
+  readonly status: string
+  readonly error?: string
+  readonly sentAt: string
+}): string {
+  const error = entry.error === undefined ? '' : `  ${entry.error}`
+  return `${entry.id}  ${entry.source}  ${entry.subject}  ${entry.status} → ${entry.target}${error}  ${entry.sentAt}`
 }

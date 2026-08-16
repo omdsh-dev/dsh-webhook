@@ -1,6 +1,7 @@
 /**
  * Model-facing tools: webhook_add, webhook_list, webhook_remove,
- * webhook_deliveries, webhook_replay.
+ * webhook_deliveries, webhook_replay, webhook_pause, webhook_resume,
+ * webhook_callbacks.
  * @module dsh-webhook/tools
  */
 
@@ -142,6 +143,67 @@ export function registerWebhookTools(ctx: Context, engine: WebhookEngine): void 
       const id = args.delivery_id.trim()
       if (id.length === 0) throw new Error('webhook_replay: delivery_id must be non-blank')
       return engine.replay(id).then(result => result as unknown as JsonValue)
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'webhook_pause',
+    description: 'Temporarily refuse requests to a webhook hook (403 for the sender) without removing it; resumes with webhook_resume.',
+    parameters: {
+      name: {
+        type: 'string',
+        required: true,
+        description: 'Hook name as returned by webhook_add or webhook_list.',
+      },
+    },
+    output: {
+      schema: { type: 'json' } as const,
+      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
+    },
+    execute: (args) => {
+      const name = args.name.trim()
+      if (name.length === 0) throw new Error('webhook_pause: name must be non-blank')
+      return Promise.resolve({ name, paused: engine.service().pause(name) })
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'webhook_resume',
+    description: 'Accept requests to a paused webhook hook again.',
+    parameters: {
+      name: {
+        type: 'string',
+        required: true,
+        description: 'Hook name as returned by webhook_add or webhook_list.',
+      },
+    },
+    output: {
+      schema: { type: 'json' } as const,
+      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
+    },
+    execute: (args) => {
+      const name = args.name.trim()
+      if (name.length === 0) throw new Error('webhook_resume: name must be non-blank')
+      return Promise.resolve({ name, paused: !engine.service().resume(name) })
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'webhook_callbacks',
+    description: 'List recent outbound callback attempts: target, status (sent/failed), and error for failures. Callbacks fire when a delivery settles (delivered with an outcome, or held) against configured rules; the same rules also serve events emitted by other plugins through the callbacks service.',
+    parameters: {
+      limit: {
+        type: 'number',
+        description: 'How many recent attempts to return; defaults to 20, capped at 100.',
+      },
+    },
+    output: {
+      schema: { type: 'json' } as const,
+      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
+    },
+    execute: (args) => {
+      const limit = args.limit === undefined ? 20 : Math.max(1, Math.min(100, args.limit))
+      return Promise.resolve(engine.service().callbacks(limit) as unknown as JsonValue)
     },
   }))
 }

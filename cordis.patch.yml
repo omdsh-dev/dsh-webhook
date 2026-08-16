@@ -13,6 +13,7 @@
       #   busyDelivery: followup       # or 'inject' (busy-target delivery mode)
       #   coldWake: false              # resume a cold target session for delivery
       #   hooks: []                    # static hooks; see README
+      #   callbacks: []                # global callback rules; see README
 
 # No invariant companion row: the shipped web/headless profiles do not compose
 # the `invariants` service, so an invariant row would never resolve there.

@@ -4,6 +4,7 @@
  */
 
 import z from '@deepseek-ai/schemastery'
+import type { CallbackRule } from './callbacks.ts'
 
 /** Static hook definitions declared in configuration. */
 export interface StaticHook {
@@ -19,6 +20,10 @@ export interface StaticHook {
   header?: string
   /** Preferred delivery target session id, optional. */
   target?: string | null
+  /** Requests are refused while paused. */
+  paused?: boolean
+  /** Hook-level outbound callbacks fired when a delivery settles. */
+  callbacks?: readonly Omit<CallbackRule, 'source'>[]
 }
 
 export interface Config {
@@ -38,6 +43,8 @@ export interface Config {
   readonly dataDir?: string
   /** Static hooks installed on load. */
   readonly hooks?: readonly StaticHook[]
+  /** Global outbound callback rules; every matching rule fires on settle. */
+  readonly callbacks?: readonly CallbackRule[]
 }
 
 export interface ResolvedConfig {
@@ -49,6 +56,7 @@ export interface ResolvedConfig {
   readonly coldWake: boolean
   readonly dataDir: string | null
   readonly hooks: readonly StaticHook[]
+  readonly callbacks: readonly CallbackRule[]
 }
 
 /** Public bind: secret-less hooks are refused everywhere. */
@@ -63,6 +71,21 @@ const staticHookSchema = z.object({
   secretRef: z.string(),
   header: z.string(),
   target: z.string(),
+  paused: z.boolean(),
+  callbacks: z.array(z.object({
+    target: z.string(),
+    secretRef: z.string(),
+    statuses: z.array(z.string()),
+    outcomes: z.array(z.string()),
+  })),
+})
+
+const callbackRuleSchema = z.object({
+  source: z.union([z.const('webhook'), z.const('cron')]),
+  statuses: z.array(z.string()),
+  outcomes: z.array(z.string()),
+  target: z.string(),
+  secretRef: z.string(),
 })
 
 /**
@@ -80,6 +103,7 @@ export const Config = z.object({
   coldWake: z.boolean().default(false),
   dataDir: z.string(),
   hooks: z.array(staticHookSchema),
+  callbacks: z.array(callbackRuleSchema),
 }) as unknown as z<Config>
 
 export function resolveConfig(config: Config): ResolvedConfig {
@@ -92,6 +116,10 @@ export function resolveConfig(config: Config): ResolvedConfig {
   if (maxPayloadBytes < 1) throw new Error('dsh-webhook: maxPayloadBytes must be positive')
   const rateLimitPerMinute = config.rateLimitPerMinute ?? 60
   if (rateLimitPerMinute < 1) throw new Error('dsh-webhook: rateLimitPerMinute must be positive')
+  const callbacks = (config.callbacks ?? []).map(rule => {
+    if (rule.target.trim().length === 0) throw new Error('dsh-webhook: callback target must be non-blank')
+    return rule
+  })
   return {
     bind,
     port,
@@ -101,5 +129,6 @@ export function resolveConfig(config: Config): ResolvedConfig {
     coldWake: config.coldWake ?? false,
     dataDir: config.dataDir ?? null,
     hooks: config.hooks ?? [],
+    callbacks,
   }
 }
