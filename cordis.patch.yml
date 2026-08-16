@@ -1,0 +1,18 @@
+# Bundle patch applied over the selected DSH profile when this package is listed
+# in `dsh.profile.bundles`. The row id is deployment-local; the package name
+# must match package.json.
+
+- insert:
+    - id: dsh-webhook
+      name: dsh-webhook
+      # config:
+      #   bind: 127.0.0.1              # listen address; a public bind requires every hook to carry a secretRef
+      #   port: 8788                   # listen port
+      #   maxPayloadBytes: 262144      # request body cap
+      #   rateLimitPerMinute: 60       # per-hook accepted-request budget
+      #   busyDelivery: followup       # or 'inject' (busy-target delivery mode)
+      #   coldWake: false              # resume a cold target session for delivery
+      #   hooks: []                    # static hooks; see README
+
+# No invariant companion row: the shipped web/headless profiles do not compose
+# the `invariants` service, so an invariant row would never resolve there.
