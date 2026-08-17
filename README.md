@@ -1,4 +1,10 @@
+<p align="center">
+  <img src="./assets/readme/hero.svg" width="100%" alt="dsh-webhook — signed HTTP events become executed agent tasks with receipts">
+</p>
+
 # dsh-webhook
+
+English | [中文](README.zh.md)
 
 Inbound webhooks for DeepSeek Harness: signed HTTP events become executed agent tasks with delivery receipts — deduplicated, replayable, and honest about what happened.
 
@@ -81,7 +87,7 @@ Every settled delivery — `delivered` with an outcome, or `held` without a targ
 
 Targets:
 
-- `https://…` — POST with the event as JSON; optional `secretRef` adds `Authorization: Bearer <resolved>`. Single attempt with a 10 s timeout; no retry in v0.2 (a failure is recorded, not retried).
+- `https://…` — POST with the event as JSON; optional `secretRef` adds `Authorization: Bearer <resolved>`. Single attempt with a 10 s timeout; no retry yet (a failure is recorded, not retried).
 - `local://macos-notification` — a macOS notification (`display notification`) with the subject and result excerpt.
 
 Rules filter by `source` (`webhook` | `cron`), delivery `statuses`, and task `outcomes`; absent filters match anything. Fire-and-forget by design: a callback failure never blocks delivery settling.
@@ -168,4 +174,4 @@ pnpm run prepare
 
 ## License
 
-MIT; see `LICENSE`.
+[MIT](LICENSE)
