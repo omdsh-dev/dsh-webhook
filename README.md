@@ -144,7 +144,7 @@ The payload arrives as a bounded `<raw_payload_excerpt>` block; payload content 
 | `hooks` | `[]` | Static hook definitions: `name`, `promptTemplate`, `authKind`, `secretRef`, `header`, `target`, `paused`, `callbacks` |
 | `callbacks` | `[]` | Global callback rules: `source`, `statuses`, `outcomes`, `target`, `secretRef` |
 
-Hooks, deliveries, and callback history written by another dsh process sharing the same Harness home are picked up live: `store.json` is file-watched (self-writes are recognized and skipped), so a hook registered in a headless run is served by a running `dsh web` without a restart.
+Hooks, deliveries, and callback history written by another dsh process sharing the same Harness home are picked up live: `store.json` is file-watched (self-writes are recognized and skipped), so a hook registered in a headless run is served by a running `dsh web` without a restart. Concurrent writes are merged at the record level under a short-lived store write lock; when both sides edited the same record, the last writer wins on that record, and a record one side deleted is never resurrected.
 
 ## Deployment
 

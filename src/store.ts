@@ -5,7 +5,8 @@
  */
 
 import { mkdirSync, readFileSync, renameSync, statSync, writeFileSync, type Stats } from 'node:fs'
-import { dirname } from 'node:path'
+import { dirname, join } from 'node:path'
+import { acquireDirLock, type DirLock } from './filelock.ts'
 
 /** HMAC-SHA256 signature check (GitHub-style `sha256=<hex>` header). */
 export interface HmacAuth {
@@ -155,6 +156,13 @@ function isValidCallbackEntry(value: unknown): value is CallbackLogEntry {
 /**
  * JSON-file store for hooks and deliveries. Writes are atomic; a corrupt file
  * is quarantined aside instead of breaking the host boot.
+ *
+ * Several dsh processes can share one store file (web plus headless runs).
+ * Every write takes a short-lived directory lock and, when another process
+ * wrote since our last write, merges the two sides at the record level before
+ * persisting: records only one side knows are adopted, and a record both sides
+ * edited is last-writer-wins. The lock also backs id allocation through a
+ * sidecar seq file, so ids never collide across processes.
  */
 export class WebhookStore {
   private seq = 0
@@ -164,11 +172,22 @@ export class WebhookStore {
   private watcher: ReturnType<typeof setInterval> | null = null
   private lastWritten: string | null = null
   private lastStat: { mtimeMs: number; size: number } | null = null
+  private readonly writeLockDir: string
+  private readonly seqFile: string
+  /** Serialized form of each record as of our last load or write. */
+  private readonly baseHooks = new Map<string, string>()
+  private readonly baseDeliveries = new Map<string, string>()
+  private readonly baseCallbacks = new Map<string, string>()
+  /** Records we dropped since our last load; a merge must not resurrect them. */
+  private readonly deletedIds = new Set<string>()
 
   constructor(
     private readonly filePath: string,
     private readonly warn: (message: string) => void,
-  ) {}
+  ) {
+    this.writeLockDir = join(dirname(filePath), 'store.lock')
+    this.seqFile = `${filePath}.seq`
+  }
 
   /** Load the store from disk; a missing file means an empty store. */
   load(): void {
@@ -222,6 +241,57 @@ export class WebhookStore {
       ? parsed.callbacks.filter((entry: unknown) => isValidCallbackEntry(entry))
       : []
     this.seq = typeof parsed.seq === 'number' && Number.isSafeInteger(parsed.seq) ? parsed.seq : hooks.length
+    this.rebaseSnapshots()
+    const sidecar = this.readSeqSidecar()
+    if (sidecar !== null && sidecar > this.seq) this.seq = sidecar
+  }
+
+  /** Forget per-record provenance and lock state after a wholesale reload. */
+  private rebaseSnapshots(): void {
+    this.baseHooks.clear()
+    this.baseDeliveries.clear()
+    this.baseCallbacks.clear()
+    this.deletedIds.clear()
+    for (const hook of this.hookList) this.baseHooks.set(hook.id, JSON.stringify(hook))
+    for (const delivery of this.deliveryList) this.baseDeliveries.set(delivery.id, JSON.stringify(delivery))
+    for (const entry of this.callbackLogList) this.baseCallbacks.set(entry.id, JSON.stringify(entry))
+  }
+
+  /** Highest numeric id recorded anywhere, used to keep ids monotonic. */
+  private static maxSeq(floor: number, records: readonly { id: string }[]): number {
+    let max = floor
+    for (const record of records) {
+      const numeric = Number(record.id.slice(record.id.lastIndexOf('-') + 1))
+      if (Number.isSafeInteger(numeric) && numeric > max) max = numeric
+    }
+    return max
+  }
+
+  /** Seq persisted by other processes during their id allocations. */
+  private readSeqSidecar(): number | null {
+    try {
+      const numeric = Number(readFileSync(this.seqFile, 'utf8').trim())
+      return Number.isSafeInteger(numeric) && numeric > 0 ? numeric : null
+    } catch {
+      return null
+    }
+  }
+
+  private writeSeqSidecar(): void {
+    try {
+      writeFileSync(this.seqFile, `${this.seq}\n`)
+    } catch (error) {
+      this.warn(`dsh-webhook: seq sidecar write failed: ${String(error)}`)
+    }
+  }
+
+  /** Report a write-lock contention, degrading instead of blocking. */
+  private reportLock(lock: DirLock): void {
+    if (lock.reason === 'held') {
+      this.warn(`dsh-webhook: another instance (pid ${lock.heldBy}) holds the store write lock; persisting without merge`)
+    } else {
+      this.warn('dsh-webhook: store write lock contention; persisting without merge')
+    }
   }
 
   /** Hooks in insertion order. */
@@ -239,9 +309,28 @@ export class WebhookStore {
     return this.hookList.find(hook => hook.id === id)
   }
 
-  /** Allocate the next never-reused id with the given prefix. */
+  /**
+   * Allocate the next never-reused id with the given prefix. The write lock
+   * serializes allocation against other processes sharing the store, and the
+   * seq sidecar carries the last allocated number, so two processes can never
+   * mint the same id even before either has persisted a record.
+   */
   allocateId(prefix: string): string {
-    this.seq += 1
+    mkdirSync(dirname(this.filePath), { recursive: true })
+    const lock = acquireDirLock(this.writeLockDir)
+    try {
+      if (!lock.acquired) {
+        this.reportLock(lock)
+        this.seq += 1
+      } else {
+        const diskSeq = this.readSeqSidecar()
+        if (diskSeq !== null && diskSeq > this.seq) this.seq = diskSeq
+        this.seq += 1
+        this.writeSeqSidecar()
+      }
+    } finally {
+      lock.release()
+    }
     return `${prefix}-${this.seq}`
   }
 
@@ -256,7 +345,11 @@ export class WebhookStore {
     const index = this.hookList.findIndex(hook => hook.id === id)
     if (index === -1) return false
     this.hookList.splice(index, 1)
+    for (const delivery of this.deliveryList) {
+      if (delivery.hookId === id) this.deletedIds.add(delivery.id)
+    }
     this.deliveryList = this.deliveryList.filter(delivery => delivery.hookId !== id)
+    this.deletedIds.add(id)
     this.persist()
     return true
   }
@@ -284,8 +377,10 @@ export class WebhookStore {
     this.deliveryList.push(delivery)
     const mine = this.deliveryList.filter(entry => entry.hookId === delivery.hookId)
     if (mine.length > MAX_DELIVERIES_PER_HOOK) {
-      const overflow = new Set(mine.slice(0, mine.length - MAX_DELIVERIES_PER_HOOK).map(entry => entry.id))
-      this.deliveryList = this.deliveryList.filter(entry => !overflow.has(entry.id))
+      const overflow = mine.slice(0, mine.length - MAX_DELIVERIES_PER_HOOK)
+      const overflowIds = new Set(overflow.map(entry => entry.id))
+      for (const id of overflowIds) this.deletedIds.add(id)
+      this.deliveryList = this.deliveryList.filter(entry => !overflowIds.has(entry.id))
     }
     this.persist()
   }
@@ -308,9 +403,128 @@ export class WebhookStore {
   appendCallbackLog(entry: CallbackLogEntry): void {
     this.callbackLogList.push(entry)
     if (this.callbackLogList.length > MAX_CALLBACK_LOG) {
+      const overflow = this.callbackLogList.slice(0, this.callbackLogList.length - MAX_CALLBACK_LOG)
+      for (const dropped of overflow) this.deletedIds.add(dropped.id)
       this.callbackLogList = this.callbackLogList.slice(-MAX_CALLBACK_LOG)
     }
     this.persist()
+  }
+
+  /**
+   * Persist after an in-place record mutation. Takes the store write lock,
+   * merges any records another process wrote since our last write, then
+   * atomically replaces the file.
+   */
+  private persist(): void {
+    mkdirSync(dirname(this.filePath), { recursive: true })
+    const lock = acquireDirLock(this.writeLockDir)
+    try {
+      if (lock.acquired) {
+        this.writeSnapshot(this.mergeFromDisk())
+      } else {
+        this.reportLock(lock)
+        this.writeSnapshot(null)
+      }
+    } finally {
+      lock.release()
+    }
+  }
+
+  /**
+   * Atomically write a snapshot to the store file and the seq sidecar.
+   * @param merged - the merged record lists when an external write was
+   *   folded in, or null to write our in-memory state as-is.
+   */
+  private writeSnapshot(merged: { hooks: WebhookHook[]; deliveries: WebhookDelivery[]; callbacks: CallbackLogEntry[] } | null): void {
+    const hooks = merged?.hooks ?? this.hookList
+    const deliveries = merged?.deliveries ?? this.deliveryList
+    const callbacks = merged?.callbacks ?? this.callbackLogList
+    if (merged !== null) {
+      this.seq = WebhookStore.maxSeq(this.seq, [...hooks, ...deliveries, ...callbacks])
+    }
+    const payload = JSON.stringify({
+      version: STORE_VERSION,
+      seq: this.seq,
+      hooks,
+      deliveries,
+      callbacks,
+    }, null, 2)
+    const content = `${payload}\n`
+    this.lastWritten = content
+    const temporary = `${this.filePath}.tmp-${process.pid}`
+    writeFileSync(temporary, content)
+    renameSync(temporary, this.filePath)
+    this.writeSeqSidecar()
+    this.deletedIds.clear()
+    this.updateProvenance()
+  }
+
+  /**
+   * Track the version our memory holds for each record, so a later merge can
+   * tell our edits from the peer's. A record we adopted from the peer keeps
+   * its old provenance (our memory still matches it), which keeps the merge
+   * idempotent; a record we created or edited records our own version.
+   */
+  private updateProvenance(): void {
+    for (const record of this.hookList) {
+      if (JSON.stringify(record) !== this.baseHooks.get(record.id)) this.baseHooks.set(record.id, JSON.stringify(record))
+    }
+    for (const delivery of this.deliveryList) {
+      if (JSON.stringify(delivery) !== this.baseDeliveries.get(delivery.id)) this.baseDeliveries.set(delivery.id, JSON.stringify(delivery))
+    }
+    for (const entry of this.callbackLogList) {
+      if (JSON.stringify(entry) !== this.baseCallbacks.get(entry.id)) this.baseCallbacks.set(entry.id, JSON.stringify(entry))
+    }
+  }
+
+  /**
+   * Read the current disk state and merge it with ours at the record level.
+   * Returns null when the file is absent, unchanged since our last write, or
+   * unreadable — in all of which cases our in-memory state is written as-is.
+   */
+  private mergeFromDisk(): { hooks: WebhookHook[]; deliveries: WebhookDelivery[]; callbacks: CallbackLogEntry[] } | null {
+    let raw: string
+    try {
+      raw = readFileSync(this.filePath, 'utf8')
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        this.warn(`dsh-webhook: store merge read failed: ${String(error)}`)
+      }
+      return null
+    }
+    if (raw === this.lastWritten) return null
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(raw)
+    } catch {
+      this.warn('dsh-webhook: external store content is corrupt; writing local state over it')
+      return null
+    }
+    if (!isRecord(parsed) || parsed.version !== STORE_VERSION
+      || !Array.isArray(parsed.hooks) || !Array.isArray(parsed.deliveries)) {
+      this.warn('dsh-webhook: unsupported external store format; writing local state over it')
+      return null
+    }
+    const diskHooks = new Map<string, WebhookHook>()
+    for (const entry of parsed.hooks) {
+      if (isValidHook(entry)) diskHooks.set(entry.id, { ...entry, paused: entry.paused ?? false })
+    }
+    const diskDeliveries = new Map<string, WebhookDelivery>()
+    for (const entry of parsed.deliveries) {
+      if (isValidDelivery(entry)) diskDeliveries.set(entry.id, entry)
+    }
+    const diskCallbacks = new Map<string, CallbackLogEntry>()
+    if (Array.isArray(parsed.callbacks)) {
+      for (const entry of parsed.callbacks) {
+        if (isValidCallbackEntry(entry)) diskCallbacks.set(entry.id, entry)
+      }
+    }
+    const diskSeq = typeof parsed.seq === 'number' && Number.isSafeInteger(parsed.seq) ? parsed.seq : 0
+    const hooks = mergeRecords(this.hookList, this.baseHooks, diskHooks, this.deletedIds)
+    const deliveries = mergeRecords(this.deliveryList, this.baseDeliveries, diskDeliveries, this.deletedIds)
+    const callbacks = mergeRecords(this.callbackLogList, this.baseCallbacks, diskCallbacks, this.deletedIds)
+    this.seq = WebhookStore.maxSeq(Math.max(this.seq, diskSeq), [...hooks, ...deliveries, ...callbacks])
+    return { hooks, deliveries, callbacks }
   }
 
   /** Persist after an in-place record mutation. */
@@ -381,22 +595,47 @@ export class WebhookStore {
       this.watcher = null
     }
   }
+}
 
-  private persist(): void {
-    mkdirSync(dirname(this.filePath), { recursive: true })
-    const payload = JSON.stringify({
-      version: STORE_VERSION,
-      seq: this.seq,
-      hooks: this.hookList,
-      deliveries: this.deliveryList,
-      callbacks: this.callbackLogList,
-    }, null, 2)
-    const content = `${payload}\n`
-    this.lastWritten = content
-    const temporary = `${this.filePath}.tmp-${process.pid}`
-    writeFileSync(temporary, content)
-    renameSync(temporary, this.filePath)
+/**
+ * Merge one record list with the current disk state. Per-record semantics:
+ *
+ * - a record only the other side has is adopted, in the disk order;
+ * - a record we created or edited wins over the other side's version
+ *   (last-writer-wins on the record);
+ * - a record we have not touched since our last load or write takes the
+ *   other side's version, or is dropped when the other side deleted it;
+ * - records only we hold are appended after the disk records;
+ * - a record we dropped (in `deleted`) is never resurrected.
+ */
+function mergeRecords<T extends { id: string }>(
+  ours: readonly T[],
+  base: ReadonlyMap<string, string>,
+  latest: ReadonlyMap<string, T>,
+  deleted: ReadonlySet<string>,
+): T[] {
+  const merged: T[] = []
+  const seen = new Set<string>()
+  const byId = new Map<string, T>()
+  for (const record of ours) byId.set(record.id, record)
+  for (const [id, current] of latest) {
+    if (deleted.has(id)) continue
+    seen.add(id)
+    const our = byId.get(id)
+    if (our === undefined) {
+      merged.push(current)
+    } else if (JSON.stringify(our) === base.get(id)) {
+      merged.push(current)
+    } else {
+      merged.push(our)
+    }
   }
+  for (const record of ours) {
+    if (seen.has(record.id) || deleted.has(record.id)) continue
+    if (JSON.stringify(record) === base.get(record.id)) continue
+    merged.push(record)
+  }
+  return merged
 }
 
 export { MAX_STORED_PAYLOAD_BYTES }

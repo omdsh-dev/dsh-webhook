@@ -144,7 +144,7 @@ payload 以受限的 `<raw_payload_excerpt>` 块到达；payload 内容按不可
 | `hooks` | `[]` | 静态 hook 定义：`name`、`promptTemplate`、`authKind`、`secretRef`、`header`、`target`、`paused`、`callbacks` |
 | `callbacks` | `[]` | 全局回调规则：`source`、`statuses`、`outcomes`、`target`、`secretRef` |
 
-由共享同一 Harness home 的其他 dsh 进程写入的 hook、投递与回调历史会被实时拾取：`store.json` 通过文件监听（自写被识别并跳过），所以在 headless 运行里注册的 hook 无需重启即可被运行中的 `dsh web` 服务。
+由共享同一 Harness home 的其他 dsh 进程写入的 hook、投递与回调历史会被实时拾取：`store.json` 通过文件监听（自写被识别并跳过），所以在 headless 运行里注册的 hook 无需重启即可被运行中的 `dsh web` 服务。并发写以记录为单位在短时持有的存储写锁下合并；同一记录被双方编辑时按记录后写者胜出，被任一方删除的记录不会被复活。
 
 ## 部署
 
