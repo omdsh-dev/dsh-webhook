@@ -2,37 +2,55 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { CallbackDispatcher, deliveryCallbackEvent, LOCAL_NOTIFICATION_SCHEME, validateTarget } from '../src/callbacks.ts'
+import { CallbackDispatcher, deliveryCallbackEvent, LOCAL_NOTIFICATION_SCHEME, validateTarget, type CallbackRetryPolicy } from '../src/callbacks.ts'
 import { WebhookStore } from '../src/store.ts'
 
 interface DispatcherHarness {
   dispatcher: CallbackDispatcher
   store: WebhookStore
+  dir: string
+  clock: { now: number }
   runLocal: ReturnType<typeof vi.fn>
   sendHttp: ReturnType<typeof vi.fn>
   resolveSecret: ReturnType<typeof vi.fn>
   onAttempt: ReturnType<typeof vi.fn>
+  warn: ReturnType<typeof vi.fn>
+  advance(ms: number): void
 }
 
-function createHarness(): DispatcherHarness {
-  const dir = mkdtempSync(join(tmpdir(), 'dsh-webhook-callbacks-'))
+function createHarness(overrides: { retry?: CallbackRetryPolicy; clock?: { now: number }; dir?: string } = {}): DispatcherHarness {
+  const dir = overrides.dir ?? mkdtempSync(join(tmpdir(), 'dsh-webhook-callbacks-'))
   const store = new WebhookStore(join(dir, 'store.json'), () => {})
   store.load()
+  const clock = overrides.clock ?? { now: 1_000_000 }
   const runLocal = vi.fn<(script: string) => Promise<{ ok: boolean; error?: string }>>(async () => ({ ok: true }))
   const sendHttp = vi.fn<(url: string, init: { headers: Record<string, string>; body: string; signal: AbortSignal }) => Promise<{ ok: boolean; error?: string }>>(async () => ({ ok: true }))
   const resolveSecret = vi.fn<(ref: string) => Promise<string | undefined>>(async (ref: string) => ref === 'TOKEN' ? 's3cret' : undefined)
   const onAttempt = vi.fn()
+  const warn = vi.fn()
   const dispatcher = new CallbackDispatcher({
     store,
     resolveSecret: ref => resolveSecret(ref),
-    now: () => Date.now(),
-    warn: () => {},
+    now: () => clock.now,
+    warn: message => warn(message),
     info: () => {},
     runLocal: script => runLocal(script),
     sendHttp: (url, init) => sendHttp(url, init),
     onAttempt,
+    retry: overrides.retry ?? { maxAttempts: 4, backoffBaseMs: 1_000, maxBackoffMs: 100_000 },
   })
-  return { dispatcher, store, runLocal, sendHttp, resolveSecret, onAttempt }
+  return {
+    dispatcher,
+    store,
+    dir,
+    clock,
+    runLocal,
+    sendHttp,
+    resolveSecret,
+    onAttempt,
+    warn,
+    advance: ms => { clock.now += ms },
+  }
 }
 
 const event = {
@@ -164,6 +182,124 @@ describe('CallbackDispatcher', () => {
     expect(validateTarget(LOCAL_NOTIFICATION_SCHEME)).toBe(LOCAL_NOTIFICATION_SCHEME)
     expect(() => validateTarget('ftp://nope')).toThrow('must be http(s)://')
     expect(() => validateTarget('local://other')).toThrow('must be http(s)://')
+  })
+})
+
+describe('CallbackDispatcher retries', () => {
+  it('queues a failed attempt and succeeds on the retry with the attempt recorded', async () => {
+    const harness = createHarness()
+    harness.sendHttp.mockResolvedValueOnce({ ok: false, error: 'HTTP 502' })
+    harness.dispatcher.emit(event, [{ target: 'https://hooks.example.com/ingest' }])
+    await vi.waitFor(() => expect(harness.store.callbackLogs()).toHaveLength(1))
+    expect(harness.store.callbackLogs()[0]).toMatchObject({ status: 'failed', attempt: 1 })
+    expect(harness.store.retries()).toHaveLength(1)
+    expect(harness.store.retries()[0]).toMatchObject({ attempts: 1, target: 'https://hooks.example.com/ingest', deliveryId: 'dl-2' })
+
+    harness.advance(1_000)
+    await harness.dispatcher.retryDue()
+    expect(harness.sendHttp).toHaveBeenCalledTimes(2)
+    expect(harness.store.retries()).toHaveLength(0)
+    const log = harness.store.callbackLogs()
+    expect(log).toHaveLength(2)
+    expect(log[0]).toMatchObject({ status: 'sent', attempt: 2 })
+    expect(log[1]).toMatchObject({ status: 'failed', attempt: 1 })
+    expect(harness.onAttempt).toHaveBeenLastCalledWith('dl-2', expect.objectContaining({ status: 'sent', attempt: 2, target: 'https://hooks.example.com/ingest' }))
+  })
+
+  it('exhausts the retry budget and settles the queue as failed', async () => {
+    const harness = createHarness({ retry: { maxAttempts: 3, backoffBaseMs: 1_000, maxBackoffMs: 100_000 } })
+    harness.sendHttp.mockResolvedValue({ ok: false, error: 'HTTP 500' })
+    harness.dispatcher.emit(event, [{ target: 'https://hooks.example.com/ingest' }])
+    await vi.waitFor(() => expect(harness.store.retries()).toHaveLength(1))
+    harness.advance(1_000)
+    await harness.dispatcher.retryDue()
+    harness.advance(2_000)
+    await harness.dispatcher.retryDue()
+    expect(harness.sendHttp).toHaveBeenCalledTimes(3)
+    expect(harness.store.retries()).toHaveLength(0)
+    expect(harness.store.callbackLogs()).toHaveLength(3)
+    expect(harness.store.callbackLogs().map(entry => entry.attempt)).toEqual([3, 2, 1])
+    expect(harness.warn).toHaveBeenCalledWith(expect.stringContaining('failed after 3 attempt(s)'))
+  })
+
+  it('skips the queue entirely when retries are disabled', async () => {
+    const harness = createHarness({ retry: { maxAttempts: 1, backoffBaseMs: 1_000, maxBackoffMs: 100_000 } })
+    harness.sendHttp.mockResolvedValueOnce({ ok: false, error: 'HTTP 503' })
+    harness.dispatcher.emit(event, [{ target: 'https://hooks.example.com/ingest' }])
+    await vi.waitFor(() => expect(harness.store.callbackLogs()).toHaveLength(1))
+    expect(harness.store.retries()).toHaveLength(0)
+    expect(harness.warn).toHaveBeenCalledWith(expect.stringContaining('failed'))
+    expect(harness.sendHttp).toHaveBeenCalledTimes(1)
+  })
+
+  it('a peer process sharing the store never re-claims a bumped retry', async () => {
+    const shared = mkdtempSync(join(tmpdir(), 'dsh-webhook-shared-'))
+    try {
+      const clock = { now: 1_000_000 }
+      const a = createHarness({ clock, dir: shared })
+      a.sendHttp.mockResolvedValueOnce({ ok: false, error: 'HTTP 502' }).mockResolvedValueOnce({ ok: false, error: 'HTTP 502' })
+      a.dispatcher.emit(event, [{ target: 'https://hooks.example.com/ingest' }])
+      await vi.waitFor(() => expect(a.store.retries()).toHaveLength(1))
+
+      const b = createHarness({ clock, dir: shared })
+      b.sendHttp.mockResolvedValue({ ok: false, error: 'HTTP 500' })
+      a.advance(1_000)
+      await a.dispatcher.retryDue()
+      expect(a.sendHttp).toHaveBeenCalledTimes(2)
+      expect(a.store.retries()[0]?.attempts).toBe(2)
+
+      // B's claim sees the bumped, re-dated item: nothing is due.
+      await b.dispatcher.retryDue()
+      expect(b.sendHttp).not.toHaveBeenCalled()
+
+      // A succeeds on the next attempt; the queue settles.
+      a.advance(2_000)
+      await a.dispatcher.retryDue()
+      expect(a.store.retries()).toHaveLength(0)
+      expect(a.sendHttp).toHaveBeenCalledTimes(3)
+      expect(a.store.callbackLogs()[0]).toMatchObject({ status: 'sent', attempt: 3 })
+    } finally {
+      rmSync(shared, { recursive: true, force: true })
+    }
+  })
+
+  it('retries survive a store reload (restart)', async () => {
+    const shared = mkdtempSync(join(tmpdir(), 'dsh-webhook-shared-'))
+    try {
+      const clock = { now: 1_000_000 }
+      const a = createHarness({ clock, dir: shared })
+      a.sendHttp.mockResolvedValueOnce({ ok: false, error: 'HTTP 502' })
+      a.dispatcher.emit(event, [{ target: 'https://hooks.example.com/ingest' }])
+      await vi.waitFor(() => expect(a.store.retries()).toHaveLength(1))
+
+      const restarted = createHarness({ clock, dir: shared })
+      restarted.sendHttp.mockResolvedValue({ ok: true })
+      restarted.advance(1_000)
+      await restarted.dispatcher.retryDue()
+      expect(restarted.sendHttp).toHaveBeenCalledTimes(1)
+      expect(restarted.store.retries()).toHaveLength(0)
+      expect(restarted.store.callbackLogs()).toHaveLength(2)
+      expect(restarted.store.callbackLogs()[0]).toMatchObject({ status: 'sent', attempt: 2 })
+    } finally {
+      rmSync(shared, { recursive: true, force: true })
+    }
+  })
+
+  it('binds the pending retry queue to 100 entries', async () => {
+    const harness = createHarness()
+    for (let index = 0; index < 105; index += 1) {
+      harness.store.appendRetry({
+        id: `rt-${index}`,
+        source: 'webhook',
+        subject: 'x',
+        target: 'https://x.example.com',
+        attempts: 1,
+        nextDueAt: 1,
+      })
+    }
+    expect(harness.store.retries()).toHaveLength(100)
+    expect(harness.store.retries()[0]?.id).toBe('rt-5')
+    expect(harness.store.retries()[99]?.id).toBe('rt-104')
   })
 })
 

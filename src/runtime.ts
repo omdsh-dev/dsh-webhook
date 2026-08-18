@@ -108,6 +108,7 @@ export function apply(ctx: Context, config: Config): void {
     resolveSecret: ref => runtime.resolveSecret(ref),
     warn: message => runtime.warn(message),
     info: message => runtime.info(message),
+    retry: { maxAttempts: resolved.callbackRetries, backoffBaseMs: 2_000, maxBackoffMs: 300_000 },
     onAttempt: (deliveryId, attempt) => {
       const delivery = store.deliveryById(deliveryId)
       if (delivery === undefined) return
@@ -216,6 +217,16 @@ export function apply(ctx: Context, config: Config): void {
   ctx.effect(() => store.watch(hooks => {
     runtime.info(`dsh-webhook: store reloaded (${hooks} hook(s))`)
   }), 'dsh-webhook: store watch')
+  ctx.effect(() => {
+    // The retry worker runs in every process sharing the store; the write
+    // lock and the per-item claim make sure each retry is dispatched by
+    // exactly one process per due window.
+    const timer = setInterval(() => {
+      void dispatcher.retryDue()
+    }, 5_000)
+    timer.unref()
+    return () => clearInterval(timer)
+  }, 'dsh-webhook: callback retries')
   ctx.effect(() => {
     let lock = acquireListenerLock(dataDir, message => runtime.warn(message))
     let retry: ReturnType<typeof setInterval> | null = null

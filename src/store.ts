@@ -88,6 +88,7 @@ export interface WebhookDelivery {
     readonly target: string
     readonly status: 'sent' | 'failed'
     readonly sentAt: string
+    readonly attempt?: number
     readonly error?: string
   }
 }
@@ -99,17 +100,51 @@ export interface CallbackLogEntry {
   readonly subject: string
   readonly target: string
   readonly status: 'sent' | 'failed'
+  /** Attempt ordinal within the retry chain; 1 for the initial try. */
+  readonly attempt?: number
   readonly error?: string
   readonly sentAt: string
 }
 
-const STORE_VERSION = 1
+/**
+ * A failed callback queued for a later attempt. The flattened event and rule
+ * make the item self-contained: matching already happened at enqueue time, so
+ * a retry never re-filters against rules that may have changed since.
+ */
+export interface PendingRetry {
+  readonly id: string
+  readonly source: 'webhook' | 'cron'
+  readonly subject: string
+  readonly status?: string
+  readonly outcome?: string
+  readonly excerpt?: string
+  readonly eventId?: string | null
+  readonly hookId?: string
+  readonly deliveryId?: string
+  readonly jobId?: string
+  readonly runId?: string
+  readonly firedAt?: string
+  readonly receivedAt?: string
+  readonly completedAt?: string
+  readonly target: string
+  readonly secretRef?: string
+  /** Attempts performed so far (1 = the initial try already failed). */
+  attempts: number
+  /** Epoch ms at which the next attempt may run. */
+  nextDueAt: number
+  readonly lastError?: string
+}
+
+const STORE_VERSION = 2
 
 /** Deliveries retained per hook. */
 const MAX_DELIVERIES_PER_HOOK = 50
 
 /** Outbound callback attempts retained globally. */
 const MAX_CALLBACK_LOG = 100
+
+/** Pending callback retries retained in the store queue. */
+const MAX_PENDING_RETRIES = 100
 
 /** Raw bodies retained for replay. */
 const MAX_STORED_PAYLOAD_BYTES = 8_192
@@ -150,7 +185,23 @@ function isValidCallbackEntry(value: unknown): value is CallbackLogEntry {
   if (typeof value.target !== 'string' || typeof value.sentAt !== 'string') return false
   if (value.source !== 'webhook' && value.source !== 'cron') return false
   if (value.status !== 'sent' && value.status !== 'failed') return false
+  if (value.attempt !== undefined && (typeof value.attempt !== 'number' || !Number.isSafeInteger(value.attempt) || value.attempt < 1)) return false
   return value.error === undefined || typeof value.error === 'string'
+}
+
+function isValidRetry(value: unknown): value is PendingRetry {
+  if (!isRecord(value)) return false
+  if (typeof value.id !== 'string' || typeof value.subject !== 'string') return false
+  if (typeof value.target !== 'string') return false
+  if (value.source !== 'webhook' && value.source !== 'cron') return false
+  if (typeof value.nextDueAt !== 'number' || !Number.isSafeInteger(value.nextDueAt)) return false
+  if (typeof value.attempts !== 'number' || !Number.isSafeInteger(value.attempts) || value.attempts < 1) return false
+  if (value.eventId !== undefined && value.eventId !== null && typeof value.eventId !== 'string') return false
+  if (value.secretRef !== undefined && typeof value.secretRef !== 'string') return false
+  for (const key of ['status', 'outcome', 'excerpt', 'hookId', 'deliveryId', 'jobId', 'runId', 'firedAt', 'receivedAt', 'completedAt', 'lastError'] as const) {
+    if (value[key] !== undefined && typeof value[key] !== 'string') return false
+  }
+  return true
 }
 
 /**
@@ -169,6 +220,7 @@ export class WebhookStore {
   private hookList: WebhookHook[] = []
   private deliveryList: WebhookDelivery[] = []
   private callbackLogList: CallbackLogEntry[] = []
+  private retryList: PendingRetry[] = []
   private watcher: ReturnType<typeof setInterval> | null = null
   private lastWritten: string | null = null
   private lastStat: { mtimeMs: number; size: number } | null = null
@@ -178,6 +230,7 @@ export class WebhookStore {
   private readonly baseHooks = new Map<string, string>()
   private readonly baseDeliveries = new Map<string, string>()
   private readonly baseCallbacks = new Map<string, string>()
+  private readonly baseRetries = new Map<string, string>()
   /** Records we dropped since our last load; a merge must not resurrect them. */
   private readonly deletedIds = new Set<string>()
 
@@ -240,6 +293,9 @@ export class WebhookStore {
     this.callbackLogList = Array.isArray(parsed.callbacks)
       ? parsed.callbacks.filter((entry: unknown) => isValidCallbackEntry(entry))
       : []
+    this.retryList = Array.isArray(parsed.retries)
+      ? parsed.retries.filter((entry: unknown) => isValidRetry(entry))
+      : []
     this.seq = typeof parsed.seq === 'number' && Number.isSafeInteger(parsed.seq) ? parsed.seq : hooks.length
     this.rebaseSnapshots()
     const sidecar = this.readSeqSidecar()
@@ -251,10 +307,12 @@ export class WebhookStore {
     this.baseHooks.clear()
     this.baseDeliveries.clear()
     this.baseCallbacks.clear()
+    this.baseRetries.clear()
     this.deletedIds.clear()
     for (const hook of this.hookList) this.baseHooks.set(hook.id, JSON.stringify(hook))
     for (const delivery of this.deliveryList) this.baseDeliveries.set(delivery.id, JSON.stringify(delivery))
     for (const entry of this.callbackLogList) this.baseCallbacks.set(entry.id, JSON.stringify(entry))
+    for (const retry of this.retryList) this.baseRetries.set(retry.id, JSON.stringify(retry))
   }
 
   /** Highest numeric id recorded anywhere, used to keep ids monotonic. */
@@ -410,6 +468,69 @@ export class WebhookStore {
     this.persist()
   }
 
+  /** Pending callback retries in enqueue order. */
+  retries(): readonly PendingRetry[] {
+    return this.retryList
+  }
+
+  /** Queue a failed callback for a later attempt, trimming to the cap. */
+  appendRetry(item: PendingRetry): void {
+    this.retryList.push(item)
+    if (this.retryList.length > MAX_PENDING_RETRIES) {
+      const overflow = this.retryList.slice(0, this.retryList.length - MAX_PENDING_RETRIES)
+      for (const dropped of overflow) this.deletedIds.add(dropped.id)
+      this.retryList = this.retryList.slice(-MAX_PENDING_RETRIES)
+    }
+    this.persist()
+  }
+
+  /** Forget a finished retry (delivered, or exhausted). */
+  settleRetry(id: string): void {
+    const index = this.retryList.findIndex(item => item.id === id)
+    if (index === -1) return
+    this.retryList.splice(index, 1)
+    this.deletedIds.add(id)
+    this.persist()
+  }
+
+  /**
+   * Claim the due retries under the store write lock and schedule each for its
+   * next attempt. The lock serializes claims across processes sharing the
+   * home, and every claimed item is re-dated before the lock is released, so
+   * no two processes dispatch the same retry. Returns the claimed items with
+   * `attempts` already bumped; an empty result (also on lock contention, with
+   * a warning) means the next tick should try again.
+   */
+  claimDueRetries(now: number, backoffBaseMs: number, maxBackoffMs: number): PendingRetry[] {
+    mkdirSync(dirname(this.filePath), { recursive: true })
+    const lock = acquireDirLock(this.writeLockDir)
+    if (!lock.acquired) {
+      this.reportLock(lock)
+      return []
+    }
+    try {
+      const merged = this.mergeFromDisk()
+      if (merged !== null) {
+        // Adopt the peer's queue into memory: the merged view is what we are
+        // about to write, and dispatch outcomes below mutate this same list.
+        this.retryList = merged.retries
+        this.baseRetries.clear()
+        for (const retry of merged.retries) this.baseRetries.set(retry.id, JSON.stringify(retry))
+      }
+      const due: PendingRetry[] = []
+      for (const item of this.retryList) {
+        if (item.nextDueAt > now) continue
+        item.attempts += 1
+        item.nextDueAt = now + Math.min(backoffBaseMs * 2 ** (item.attempts - 1), maxBackoffMs)
+        due.push(item)
+      }
+      if (due.length > 0) this.writeSnapshot(merged)
+      return due
+    } finally {
+      lock.release()
+    }
+  }
+
   /**
    * Persist after an in-place record mutation. Takes the store write lock,
    * merges any records another process wrote since our last write, then
@@ -435,12 +556,13 @@ export class WebhookStore {
    * @param merged - the merged record lists when an external write was
    *   folded in, or null to write our in-memory state as-is.
    */
-  private writeSnapshot(merged: { hooks: WebhookHook[]; deliveries: WebhookDelivery[]; callbacks: CallbackLogEntry[] } | null): void {
+  private writeSnapshot(merged: { hooks: WebhookHook[]; deliveries: WebhookDelivery[]; callbacks: CallbackLogEntry[]; retries: PendingRetry[] } | null): void {
     const hooks = merged?.hooks ?? this.hookList
     const deliveries = merged?.deliveries ?? this.deliveryList
     const callbacks = merged?.callbacks ?? this.callbackLogList
+    const retries = merged?.retries ?? this.retryList
     if (merged !== null) {
-      this.seq = WebhookStore.maxSeq(this.seq, [...hooks, ...deliveries, ...callbacks])
+      this.seq = WebhookStore.maxSeq(this.seq, [...hooks, ...deliveries, ...callbacks, ...retries])
     }
     const payload = JSON.stringify({
       version: STORE_VERSION,
@@ -448,6 +570,7 @@ export class WebhookStore {
       hooks,
       deliveries,
       callbacks,
+      retries,
     }, null, 2)
     const content = `${payload}\n`
     this.lastWritten = content
@@ -475,6 +598,9 @@ export class WebhookStore {
     for (const entry of this.callbackLogList) {
       if (JSON.stringify(entry) !== this.baseCallbacks.get(entry.id)) this.baseCallbacks.set(entry.id, JSON.stringify(entry))
     }
+    for (const retry of this.retryList) {
+      if (JSON.stringify(retry) !== this.baseRetries.get(retry.id)) this.baseRetries.set(retry.id, JSON.stringify(retry))
+    }
   }
 
   /**
@@ -482,7 +608,7 @@ export class WebhookStore {
    * Returns null when the file is absent, unchanged since our last write, or
    * unreadable — in all of which cases our in-memory state is written as-is.
    */
-  private mergeFromDisk(): { hooks: WebhookHook[]; deliveries: WebhookDelivery[]; callbacks: CallbackLogEntry[] } | null {
+  private mergeFromDisk(): { hooks: WebhookHook[]; deliveries: WebhookDelivery[]; callbacks: CallbackLogEntry[]; retries: PendingRetry[] } | null {
     let raw: string
     try {
       raw = readFileSync(this.filePath, 'utf8')
@@ -519,12 +645,19 @@ export class WebhookStore {
         if (isValidCallbackEntry(entry)) diskCallbacks.set(entry.id, entry)
       }
     }
+    const diskRetries = new Map<string, PendingRetry>()
+    if (Array.isArray(parsed.retries)) {
+      for (const entry of parsed.retries) {
+        if (isValidRetry(entry)) diskRetries.set(entry.id, entry)
+      }
+    }
     const diskSeq = typeof parsed.seq === 'number' && Number.isSafeInteger(parsed.seq) ? parsed.seq : 0
     const hooks = mergeRecords(this.hookList, this.baseHooks, diskHooks, this.deletedIds)
     const deliveries = mergeRecords(this.deliveryList, this.baseDeliveries, diskDeliveries, this.deletedIds)
     const callbacks = mergeRecords(this.callbackLogList, this.baseCallbacks, diskCallbacks, this.deletedIds)
-    this.seq = WebhookStore.maxSeq(Math.max(this.seq, diskSeq), [...hooks, ...deliveries, ...callbacks])
-    return { hooks, deliveries, callbacks }
+    const retries = mergeRecords(this.retryList, this.baseRetries, diskRetries, this.deletedIds)
+    this.seq = WebhookStore.maxSeq(Math.max(this.seq, diskSeq), [...hooks, ...deliveries, ...callbacks, ...retries])
+    return { hooks, deliveries, callbacks, retries }
   }
 
   /** Persist after an in-place record mutation. */

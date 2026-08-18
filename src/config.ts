@@ -45,6 +45,12 @@ export interface Config {
   readonly hooks?: readonly StaticHook[]
   /** Global outbound callback rules; every matching rule fires on settle. */
   readonly callbacks?: readonly CallbackRule[]
+  /**
+   * Total outbound callback attempts including the initial one; 1 disables
+   * retries. Failed attempts are queued in the store with exponential
+   * backoff (2 s doubling, capped at 5 min). Defaults to 4.
+   */
+  readonly callbackRetries?: number
 }
 
 export interface ResolvedConfig {
@@ -57,6 +63,7 @@ export interface ResolvedConfig {
   readonly dataDir: string | null
   readonly hooks: readonly StaticHook[]
   readonly callbacks: readonly CallbackRule[]
+  readonly callbackRetries: number
 }
 
 /** Public bind: secret-less hooks are refused everywhere. */
@@ -104,6 +111,7 @@ export const Config = z.object({
   dataDir: z.string(),
   hooks: z.array(staticHookSchema),
   callbacks: z.array(callbackRuleSchema),
+  callbackRetries: z.natural().default(4),
 }) as unknown as z<Config>
 
 export function resolveConfig(config: Config): ResolvedConfig {
@@ -120,6 +128,10 @@ export function resolveConfig(config: Config): ResolvedConfig {
     if (rule.target.trim().length === 0) throw new Error('dsh-webhook: callback target must be non-blank')
     return rule
   })
+  const callbackRetries = config.callbackRetries ?? 4
+  if (!Number.isInteger(callbackRetries) || callbackRetries < 1) {
+    throw new Error('dsh-webhook: callbackRetries must be a positive integer')
+  }
   return {
     bind,
     port,
@@ -130,5 +142,6 @@ export function resolveConfig(config: Config): ResolvedConfig {
     dataDir: config.dataDir ?? null,
     hooks: config.hooks ?? [],
     callbacks,
+    callbackRetries,
   }
 }

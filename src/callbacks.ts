@@ -7,7 +7,7 @@
  */
 
 import { execFile } from 'node:child_process'
-import type { CallbackLogEntry, CallbackTarget, WebhookDelivery, WebhookStore } from './store.ts'
+import type { CallbackLogEntry, CallbackTarget, PendingRetry, WebhookDelivery, WebhookStore } from './store.ts'
 
 /** Event origin; `'cron'` events arrive through the published service. */
 export type CallbackEventSource = 'webhook' | 'cron'
@@ -48,6 +48,16 @@ export interface CallbackTargetConfig {
   readonly secretRef?: string
 }
 
+/** Retry policy for failed outbound callbacks. */
+export interface CallbackRetryPolicy {
+  /** Total attempts including the initial one; 1 disables retries. */
+  readonly maxAttempts: number
+  /** Delay before the first retry; doubles per attempt, capped. */
+  readonly backoffBaseMs: number
+  /** Cap on the per-attempt delay. */
+  readonly maxBackoffMs: number
+}
+
 export interface CallbackDispatcherOptions {
   readonly store: WebhookStore
   /** Resolve a credential reference to its current value. */
@@ -68,7 +78,13 @@ export interface CallbackDispatcherOptions {
    */
   sendHttp?(url: string, init: { headers: Record<string, string>; body: string; signal: AbortSignal }): Promise<{ ok: boolean; error?: string }>
   /** Called after each attempt so the originating delivery can record it. */
-  onAttempt?(deliveryId: string, attempt: { target: string; status: 'sent' | 'failed'; sentAt: string; error?: string }): void
+  onAttempt?(deliveryId: string, attempt: { target: string; status: 'sent' | 'failed'; sentAt: string; attempt?: number; error?: string }): void
+  /**
+   * Retry policy for failed attempts. Absent defaults to 4 total attempts
+   * with a 2 s base delay (2 s, 4 s, 8 s) capped at 5 minutes; the queue is
+   * persisted in the store and survives restarts.
+   */
+  retry?: CallbackRetryPolicy
 }
 
 /** Scheme prefix for the macOS notification target. */
@@ -122,21 +138,30 @@ function notificationScript(title: string, body: string): string {
 
 /**
  * Fan-out engine for outbound callbacks. One `emit` runs every matching rule
- * against its target; attempts are recorded on the store's bounded log.
+ * against its target; attempts are recorded on the store's bounded log, and
+ * failed attempts are queued for later retries with exponential backoff when
+ * a retry policy is configured.
  */
 export class CallbackDispatcher {
   private readonly runLocal: (script: string) => Promise<{ ok: boolean; error?: string }>
   private readonly sendHttp: (url: string, init: { headers: Record<string, string>; body: string; signal: AbortSignal }) => Promise<{ ok: boolean; error?: string }>
+  private readonly maxAttempts: number
+  private readonly backoffBaseMs: number
+  private readonly maxBackoffMs: number
 
   constructor(private readonly options: CallbackDispatcherOptions) {
     this.runLocal = options.runLocal ?? defaultRunLocal
     this.sendHttp = options.sendHttp ?? defaultSendHttp
+    this.maxAttempts = options.retry?.maxAttempts ?? 4
+    this.backoffBaseMs = options.retry?.backoffBaseMs ?? 2_000
+    this.maxBackoffMs = options.retry?.maxBackoffMs ?? 300_000
   }
 
   /**
    * Offer an event to every matching rule (global rules plus, for `webhook`
    * events, the hook's own targets) and record each attempt. Fire-and-forget
-   * by design: callback failures never block delivery settling.
+   * by design: callback failures never block delivery settling, and failed
+   * attempts are queued for the retry worker.
    */
   emit(event: CallbackEvent, globalRules: readonly CallbackRule[], hookTargets: readonly CallbackTarget[] = []): void {
     const webhookRules: CallbackRule[] = hookTargets.map(target => ({
@@ -148,30 +173,31 @@ export class CallbackDispatcher {
     for (const rule of [...globalRules, ...webhookRules]) {
       if (!matches(rule, event)) continue
       void this.dispatch(event, rule).then(result => {
-        const entry: CallbackLogEntry = {
-          id: this.options.store.allocateId('cb'),
-          source: event.source,
-          subject: event.subject,
-          target: rule.target,
-          status: result.ok ? 'sent' : 'failed',
-          ...(result.ok ? {} : { error: result.error }),
-          sentAt: new Date(this.options.now()).toISOString(),
-        }
-        this.options.store.appendCallbackLog(entry)
-        if (event.deliveryId !== undefined) {
-          this.options.onAttempt?.(event.deliveryId, {
-            target: rule.target,
-            status: entry.status,
-            sentAt: entry.sentAt,
-            ...(result.ok ? {} : { error: result.error }),
-          })
-        }
-        if (!result.ok) {
-          this.options.warn(`dsh-webhook: callback to ${rule.target} failed: ${result.error ?? 'unknown error'}`)
-        } else {
+        this.recordAttempt(event, rule, result, 1)
+        if (result.ok) {
           this.options.info(`dsh-webhook: callback sent to ${rule.target} (${event.subject})`)
+        } else if (this.maxAttempts > 1) {
+          this.enqueueRetry(event, rule, result, 1)
+        } else {
+          this.options.warn(`dsh-webhook: callback to ${rule.target} failed: ${result.error ?? 'unknown error'}`)
         }
       })
+    }
+  }
+
+  /**
+   * Run one retry tick: claim the due retries from the store queue and
+   * dispatch each. Serialized across processes by the store write lock, so a
+   * delivery's callback chain is attempted by exactly one process at a time.
+   */
+  async retryDue(): Promise<void> {
+    const due = this.options.store.claimDueRetries(this.options.now(), this.backoffBaseMs, this.maxBackoffMs)
+    for (const item of due) {
+      try {
+        await this.attempt(item)
+      } catch (error) {
+        this.options.warn(`dsh-webhook: callback retry crashed for ${item.id}: ${error instanceof Error ? error.message : String(error)}`)
+      }
     }
   }
 
@@ -210,6 +236,103 @@ export class CallbackDispatcher {
       return this.sendHttp(target, { headers, body, signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) })
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : String(error) }
+    }
+  }
+
+  /** One retry attempt: dispatch, record the receipt, settle or re-queue. */
+  private async attempt(item: PendingRetry): Promise<void> {
+    const event = this.eventFromRetry(item)
+    const rule: CallbackRule = {
+      target: item.target,
+      ...(item.secretRef === undefined ? {} : { secretRef: item.secretRef }),
+    }
+    const result = await this.dispatch(event, rule)
+    this.recordAttempt(event, rule, result, item.attempts)
+    if (result.ok) {
+      this.options.store.settleRetry(item.id)
+      this.options.info(`dsh-webhook: callback sent to ${item.target} (${item.subject}, attempt ${item.attempts})`)
+      return
+    }
+    if (item.attempts >= this.maxAttempts) {
+      this.options.store.settleRetry(item.id)
+      this.options.warn(`dsh-webhook: callback to ${item.target} failed after ${item.attempts} attempt(s): ${result.error ?? 'unknown error'}`)
+      return
+    }
+    // A retry stays queued; the claim already re-dated it for the next attempt.
+    this.options.warn(`dsh-webhook: callback to ${item.target} failed (attempt ${item.attempts}): ${result.error ?? 'unknown error'}; retrying`)
+  }
+
+  /** Record one dispatch outcome on the store's log and the delivery. */
+  private recordAttempt(event: CallbackEvent, rule: CallbackRule, result: { ok: boolean; error?: string }, attempt: number): void {
+    const sentAt = new Date(this.options.now()).toISOString()
+    const entry: CallbackLogEntry = {
+      id: this.options.store.allocateId('cb'),
+      source: event.source,
+      subject: event.subject,
+      target: rule.target,
+      status: result.ok ? 'sent' : 'failed',
+      attempt,
+      ...(result.ok ? {} : { error: result.error }),
+      sentAt,
+    }
+    this.options.store.appendCallbackLog(entry)
+    if (event.deliveryId !== undefined) {
+      this.options.onAttempt?.(event.deliveryId, {
+        target: rule.target,
+        status: entry.status,
+        sentAt: entry.sentAt,
+        attempt,
+        ...(result.ok ? {} : { error: result.error }),
+      })
+    }
+  }
+
+  /** Queue a failed attempt for a later try with exponential backoff. */
+  private enqueueRetry(event: CallbackEvent, rule: CallbackRule, result: { ok: boolean; error?: string }, attempt: number): void {
+    this.options.store.appendRetry({
+      id: this.options.store.allocateId('rt'),
+      source: event.source,
+      subject: event.subject,
+      ...(event.status === undefined ? {} : { status: event.status }),
+      ...(event.outcome === undefined ? {} : { outcome: event.outcome }),
+      ...(event.excerpt === undefined ? {} : { excerpt: event.excerpt }),
+      ...(event.eventId === undefined || event.eventId === null ? {} : { eventId: event.eventId }),
+      ...(event.hookId === undefined ? {} : { hookId: event.hookId }),
+      ...(event.deliveryId === undefined ? {} : { deliveryId: event.deliveryId }),
+      ...(event.jobId === undefined ? {} : { jobId: event.jobId }),
+      ...(event.runId === undefined ? {} : { runId: event.runId }),
+      ...(event.firedAt === undefined ? {} : { firedAt: event.firedAt }),
+      ...(event.receivedAt === undefined ? {} : { receivedAt: event.receivedAt }),
+      ...(event.completedAt === undefined ? {} : { completedAt: event.completedAt }),
+      target: rule.target,
+      ...(rule.secretRef === undefined ? {} : { secretRef: rule.secretRef }),
+      attempts: attempt,
+      nextDueAt: this.options.now() + this.backoff(attempt),
+      ...(result.error === undefined ? {} : { lastError: result.error }),
+    })
+  }
+
+  /** Delay after the n-th attempt, doubling and capped. */
+  private backoff(attempt: number): number {
+    return Math.min(this.backoffBaseMs * 2 ** (attempt - 1), this.maxBackoffMs)
+  }
+
+  /** Rebuild the callback event a queued retry was originally emitted for. */
+  private eventFromRetry(item: PendingRetry): CallbackEvent {
+    return {
+      source: item.source,
+      subject: item.subject,
+      ...(item.status === undefined ? {} : { status: item.status }),
+      ...(item.outcome === undefined ? {} : { outcome: item.outcome }),
+      ...(item.excerpt === undefined ? {} : { excerpt: item.excerpt }),
+      ...(item.eventId === undefined || item.eventId === null ? {} : { eventId: item.eventId }),
+      ...(item.hookId === undefined ? {} : { hookId: item.hookId }),
+      ...(item.deliveryId === undefined ? {} : { deliveryId: item.deliveryId }),
+      ...(item.jobId === undefined ? {} : { jobId: item.jobId }),
+      ...(item.runId === undefined ? {} : { runId: item.runId }),
+      ...(item.firedAt === undefined ? {} : { firedAt: item.firedAt }),
+      ...(item.receivedAt === undefined ? {} : { receivedAt: item.receivedAt }),
+      ...(item.completedAt === undefined ? {} : { completedAt: item.completedAt }),
     }
   }
 }

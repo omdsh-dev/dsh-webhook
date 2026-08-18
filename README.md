@@ -87,10 +87,10 @@ Every settled delivery — `delivered` with an outcome, or `held` without a targ
 
 Targets:
 
-- `https://…` — POST with the event as JSON; optional `secretRef` adds `Authorization: Bearer <resolved>`. Single attempt with a 10 s timeout; no retry yet (a failure is recorded, not retried).
+- `https://…` — POST with the event as JSON; optional `secretRef` adds `Authorization: Bearer <resolved>`. 10 s timeout; failed attempts are retried with exponential backoff (2 s doubling, capped at 5 min) for up to `callbackRetries` attempts (default 4), queued in the store so retries survive restarts.
 - `local://macos-notification` — a macOS notification (`display notification`) with the subject and result excerpt.
 
-Rules filter by `source` (`webhook` | `cron`), delivery `statuses`, and task `outcomes`; absent filters match anything. Fire-and-forget by design: a callback failure never blocks delivery settling.
+Rules filter by `source` (`webhook` | `cron`), delivery `statuses`, and task `outcomes`; absent filters match anything. Fire-and-forget by design: a callback failure never blocks delivery settling. Each attempt is logged with its attempt ordinal; the retry queue is persisted in `store.json`, claimed under the store write lock, and processed by whichever dsh process shares the home — so a delivery's callback chain is attempted by exactly one process per due window.
 
 ```yaml
 callbacks:
@@ -143,6 +143,7 @@ The payload arrives as a bounded `<raw_payload_excerpt>` block; payload content 
 | `dataDir` | Harness-home `webhook` directory | Directory holding `store.json` (atomic writes; a corrupt file is quarantined aside) |
 | `hooks` | `[]` | Static hook definitions: `name`, `promptTemplate`, `authKind`, `secretRef`, `header`, `target`, `paused`, `callbacks` |
 | `callbacks` | `[]` | Global callback rules: `source`, `statuses`, `outcomes`, `target`, `secretRef` |
+| `callbackRetries` | `4` | Total outbound callback attempts incl. the first; `1` disables retries |
 
 Hooks, deliveries, and callback history written by another dsh process sharing the same Harness home are picked up live: `store.json` is file-watched (self-writes are recognized and skipped), so a hook registered in a headless run is served by a running `dsh web` without a restart. Concurrent writes are merged at the record level under a short-lived store write lock; when both sides edited the same record, the last writer wins on that record, and a record one side deleted is never resurrected.
 
@@ -153,7 +154,7 @@ The server is plain HTTP by design; TLS is terminated upstream. For a public end
 ## Known limitations
 
 - The `none` auth profile accepts loopback sources only; anything else needs a `secretRef`.
-- Callback delivery is a single attempt with a timeout — no retry, no queue, no outbound receipts for the callback itself (planned: exponential backoff and vendor presets).
+- Callback retries are fire-and-forget with the store queue as the only state; a crash between a claim and its dispatch re-runs the attempt later (at-least-once), and retries have no per-callback dead-letter view beyond the log.
 - Replay is unavailable for events whose original body exceeded the stored-payload bound.
 - Outcome tracking watches one pending run per session; back-to-back events into the same session supersede the earlier watch.
 - Events are at-least-once within one host run: a crash between message enqueue and store flush can repeat a delivery.

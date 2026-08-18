@@ -87,10 +87,10 @@ allowBuilds:
 
 目标：
 
-- `https://…`——以 JSON POST 事件；可选 `secretRef` 追加 `Authorization: Bearer <resolved>`。单次尝试，10 s 超时；目前不重试（失败会被记录，不会重试）。
+- `https://…`——以 JSON POST 事件；可选 `secretRef` 追加 `Authorization: Bearer <resolved>`。10 s 超时；失败的尝试按指数退避重试（2 s 起翻倍，上限 5 分钟），最多 `callbackRetries` 次（默认 4），队列写入 store，重启后仍然有效。
 - `local://macos-notification`——macOS 通知（`display notification`），带主题与结果摘要。
 
-规则按 `source`（`webhook` | `cron`）、投递 `statuses`、任务 `outcomes` 过滤；缺省过滤器匹配任意。设计上即发即忘：回调失败绝不阻塞投递 settle。
+规则按 `source`（`webhook` | `cron`）、投递 `statuses`、任务 `outcomes` 过滤；缺省过滤器匹配任意。设计上即发即忘：回调失败绝不阻塞投递 settle。每次尝试都带尝试序号记入日志；重试队列持久化在 `store.json`，在存储写锁下领取，由共享同一 home 的任一 dsh 进程处理——因此每个投递的回调链在同一到期窗口内只由一个进程尝试。
 
 ```yaml
 callbacks:
@@ -143,6 +143,7 @@ payload 以受限的 `<raw_payload_excerpt>` 块到达；payload 内容按不可
 | `dataDir` | Harness home 的 `webhook` 目录 | `store.json` 所在目录（原子写入；损坏文件隔离另存） |
 | `hooks` | `[]` | 静态 hook 定义：`name`、`promptTemplate`、`authKind`、`secretRef`、`header`、`target`、`paused`、`callbacks` |
 | `callbacks` | `[]` | 全局回调规则：`source`、`statuses`、`outcomes`、`target`、`secretRef` |
+| `callbackRetries` | `4` | 出站回调总尝试次数（含首次）；`1` 关闭重试 |
 
 由共享同一 Harness home 的其他 dsh 进程写入的 hook、投递与回调历史会被实时拾取：`store.json` 通过文件监听（自写被识别并跳过），所以在 headless 运行里注册的 hook 无需重启即可被运行中的 `dsh web` 服务。并发写以记录为单位在短时持有的存储写锁下合并；同一记录被双方编辑时按记录后写者胜出，被任一方删除的记录不会被复活。
 
@@ -153,7 +154,7 @@ payload 以受限的 `<raw_payload_excerpt>` 块到达；payload 内容按不可
 ## 已知限制
 
 - `none` 认证只接受 loopback 来源；其他情况需要 `secretRef`。
-- 回调投递是单次尝试带超时——不重试、无队列、回调本身没有出站回执（计划：指数退避与厂商预设）。
+- 回调重试是即发即忘式的，store 队列是唯一状态；领取与派发之间崩溃会让该次尝试稍后重跑（至少一次），且重试没有逐回调的死信视图，只有日志。
 - 原始 body 超过存储 payload 上限的事件无法重放。
 - 结果跟踪每个会话只看一个进行中的运行；同会话连续事件会覆盖前一次的观察。
 - 单次主机运行内事件至少一次语义：在消息入队与存储落盘之间崩溃可能重复投递。

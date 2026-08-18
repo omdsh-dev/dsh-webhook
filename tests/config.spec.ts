@@ -17,6 +17,12 @@ describe('dsh-webhook config', () => {
     expect(resolved.rateLimitPerMinute).toBe(60)
     expect(resolved.busyDelivery).toBe('followup')
     expect(resolved.coldWake).toBe(false)
+    expect(resolved.callbackRetries).toBe(4)
+  })
+
+  it('rejects a non-positive callbackRetries', () => {
+    expect(() => resolveConfig({ callbackRetries: 0 })).toThrow('callbackRetries must be a positive integer')
+    expect(() => resolveConfig({ callbackRetries: -2 })).toThrow('callbackRetries must be a positive integer')
   })
 
   it('rejects an out-of-range port', () => {
