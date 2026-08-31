@@ -9,6 +9,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { JsonValue } from '@deepseek-ai/dsh-session'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { WebhookEngine } from './engine.ts'
+import { targetFromAgent, targetFromCwd } from './target.ts'
 
 /**
  * Register the webhook management tools on the global tool registry.
@@ -18,7 +19,7 @@ import type { WebhookEngine } from './engine.ts'
 export function registerWebhookTools(ctx: Context, engine: WebhookEngine): void {
   ctx.tools.register(defineTool({
     name: 'webhook_add',
-    description: 'Register an inbound webhook endpoint at POST /hooks/<name> that turns signed HTTP events into executed agent tasks with delivery receipts. Returns the endpoint URL to paste into the external system (e.g. GitHub webhook settings). Events are deduplicated by delivery id and replayable.',
+    description: 'Register an inbound webhook endpoint whose verified events are durably receipted and submitted as idempotent fresh-Session Automation Runs.',
     parameters: {
       name: {
         type: 'string',
@@ -43,9 +44,9 @@ export function registerWebhookTools(ctx: Context, engine: WebhookEngine): void 
         type: 'string',
         description: 'Custom header name carrying the signature or token. Defaults to x-hub-signature-256 for HMAC and authorization (Bearer scheme) for tokens.',
       },
-      target: {
+      cwd: {
         type: 'string',
-        description: 'Preferred session id to deliver into. Defaults to the creating session, then the first idle session.',
+        description: 'Absolute workspace for each fresh Automation Session. Defaults to the creating Session workspace.',
       },
     },
     output: {
@@ -62,7 +63,9 @@ export function registerWebhookTools(ctx: Context, engine: WebhookEngine): void 
             : args.auth_kind === 'bearer'
               ? { kind: 'bearer', secretRef: args.secret_ref ?? '', ...(args.header !== undefined ? { header: args.header } : {}) }
               : { kind: 'hmac-sha256', secretRef: args.secret_ref ?? '', ...(args.header !== undefined ? { header: args.header } : {}) },
-          ...(args.target !== undefined ? { target: args.target } : {}),
+          ...(args.cwd !== undefined
+            ? { target: targetFromCwd(args.cwd) }
+            : exec.agent === undefined ? {} : { target: targetFromAgent(exec.agent) }),
           createdBy: exec.agent === undefined ? null : String(exec.agent.id),
         })
         return Promise.resolve({ hook: result.hook, url: result.url } as unknown as JsonValue)
@@ -106,7 +109,7 @@ export function registerWebhookTools(ctx: Context, engine: WebhookEngine): void 
 
   ctx.tools.register(defineTool({
     name: 'webhook_deliveries',
-    description: 'List recent deliveries of one hook: status (accepted/delivered/held/rejected), event id, and outcome with a result excerpt.',
+    description: 'List recent receipts: accepted, submitted, settled, or rejected, with the linked Automation Run and outcome.',
     parameters: {
       name: {
         type: 'string',
@@ -127,7 +130,7 @@ export function registerWebhookTools(ctx: Context, engine: WebhookEngine): void 
 
   ctx.tools.register(defineTool({
     name: 'webhook_replay',
-    description: 'Re-deliver a previously recorded event through the normal path, useful for debugging a fixed template or a held delivery. Bypasses signature (already verified) but preserves deduplication.',
+    description: 'Submit a stored verified payload as a new replay occurrence. Signature verification is not repeated; the new receipt has its own idempotency key.',
     parameters: {
       delivery_id: {
         type: 'string',
@@ -190,7 +193,7 @@ export function registerWebhookTools(ctx: Context, engine: WebhookEngine): void 
 
   ctx.tools.register(defineTool({
     name: 'webhook_callbacks',
-    description: 'List recent outbound callback attempts: target, status (sent/failed), and error for failures. Callbacks fire when a delivery settles (delivered with an outcome, or held) against configured rules; the same rules also serve events emitted by other plugins through the callbacks service.',
+    description: 'List recent outbound callback attempts. Webhook callbacks fire only after the linked Automation Run reaches a terminal state.',
     parameters: {
       limit: {
         type: 'number',

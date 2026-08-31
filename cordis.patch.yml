@@ -10,8 +10,8 @@
       #   port: 8788                   # listen port
       #   maxPayloadBytes: 262144      # request body cap
       #   rateLimitPerMinute: 60       # per-hook accepted-request budget
-      #   busyDelivery: followup       # or 'inject' (busy-target delivery mode)
-      #   coldWake: false              # resume a cold target session for delivery
+      #   defaultCwd: <absolute-workspace> # required for hooks without an explicit cwd
+      #   reconcilePollMs: 1000        # durable Automation event-feed polling interval
       #   hooks: []                    # static hooks; see README
       #   callbacks: []                # global callback rules; see README
 

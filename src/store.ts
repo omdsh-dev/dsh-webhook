@@ -7,202 +7,21 @@
 import { mkdirSync, readFileSync, renameSync, statSync, writeFileSync, type Stats } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { acquireDirLock, type DirLock } from './filelock.ts'
+import type { AutomationTarget } from './automation.ts'
+import {
+  isRecord, isValidCallbackEntry, isValidDelivery, isValidHook, isValidRetry,
+  MAX_CALLBACK_LOG, MAX_DELIVERIES_PER_HOOK, MAX_PENDING_RETRIES,
+  normalizeDelivery, normalizeHook, STORE_VERSION, terminalDelivery,
+} from './store/codec.ts'
+import { mergeRecords } from './store/merge.ts'
+import type { CallbackLogEntry, PendingRetry, StoreSnapshot, WebhookDelivery, WebhookHook } from './store/types.ts'
 
-/** HMAC-SHA256 signature check (GitHub-style `sha256=<hex>` header). */
-export interface HmacAuth {
-  readonly kind: 'hmac-sha256'
-  /** Credential reference resolved through the host credentials service. */
-  readonly secretRef: string
-  /** Signature header name; defaults to `x-hub-signature-256`. */
-  readonly header?: string
-}
+export type {
+  CallbackLogEntry, CallbackTarget, HmacAuth, HookAuth, NoneAuth, PendingRetry,
+  TokenAuth, WebhookDelivery, WebhookHook,
+} from './store/types.ts'
+export { MAX_STORED_PAYLOAD_BYTES } from './store/codec.ts'
 
-/** Static token check against the Authorization bearer or a named header. */
-export interface TokenAuth {
-  readonly kind: 'bearer'
-  readonly secretRef: string
-  /** Token header name; defaults to `authorization` (Bearer scheme). */
-  readonly header?: string
-}
-
-/** No secret: requests are accepted from loopback addresses only. */
-export interface NoneAuth {
-  readonly kind: 'none'
-}
-
-export type HookAuth = HmacAuth | TokenAuth | NoneAuth
-
-/** Outbound notification rule attached to a hook or declared globally. */
-export interface CallbackTarget {
-  /** `http(s)://...` POST target or `local://macos-notification`. */
-  readonly target: string
-  /** Credential reference for the `Authorization: Bearer` header. */
-  readonly secretRef?: string
-  /** Delivery-status filter; absent matches any status. */
-  readonly statuses?: readonly string[]
-  /** Outcome filter; absent matches any outcome. */
-  readonly outcomes?: readonly string[]
-}
-
-/** One registered webhook endpoint. */
-export interface WebhookHook {
-  /** Stable store-local id, never reused within one store file. */
-  readonly id: string
-  /** URL slug; the endpoint is `POST /hooks/<name>`. */
-  readonly name: string
-  /** Prompt template; `{{payload.path}}` and `{{header.name}}` interpolate. */
-  readonly promptTemplate: string
-  readonly auth: HookAuth
-  /** Preferred delivery target session id, or null. */
-  readonly target: string | null
-  readonly createdBy: string | null
-  readonly createdAt: string
-  deliveryCount: number
-  lastDeliveryAt: string | null
-  /** Requests are refused while paused. */
-  paused: boolean
-  /** Hook-level outbound callbacks fired on settle; absent means none. */
-  callbacks?: readonly CallbackTarget[]
-}
-
-/** One recorded delivery attempt. */
-export interface WebhookDelivery {
-  readonly id: string
-  readonly hookId: string
-  readonly receivedAt: string
-  /** Deduplication key when the source supplied one, else null. */
-  readonly eventId: string | null
-  /** Request headers retained for template interpolation and replay. */
-  readonly headers: Record<string, string>
-  status: 'accepted' | 'rejected' | 'delivered' | 'held'
-  /** Rejection or hold reason for non-delivered records. */
-  reason?: string
-  /** Raw request body, capped for replay; absent when the body exceeded the cap. */
-  payload?: string
-  /** Bounded payload preview for listings. */
-  readonly payloadExcerpt: string
-  outcome?: 'completed' | 'error' | 'cancelled' | 'timeout'
-  excerpt?: string
-  /** Result of the last outbound callback attempt for this delivery. */
-  lastCallback?: {
-    readonly target: string
-    readonly status: 'sent' | 'failed'
-    readonly sentAt: string
-    readonly attempt?: number
-    readonly error?: string
-  }
-}
-
-/** One recorded outbound callback attempt. */
-export interface CallbackLogEntry {
-  readonly id: string
-  readonly source: 'webhook' | 'cron'
-  readonly subject: string
-  readonly target: string
-  readonly status: 'sent' | 'failed'
-  /** Attempt ordinal within the retry chain; 1 for the initial try. */
-  readonly attempt?: number
-  readonly error?: string
-  readonly sentAt: string
-}
-
-/**
- * A failed callback queued for a later attempt. The flattened event and rule
- * make the item self-contained: matching already happened at enqueue time, so
- * a retry never re-filters against rules that may have changed since.
- */
-export interface PendingRetry {
-  readonly id: string
-  readonly source: 'webhook' | 'cron'
-  readonly subject: string
-  readonly status?: string
-  readonly outcome?: string
-  readonly excerpt?: string
-  readonly eventId?: string | null
-  readonly hookId?: string
-  readonly deliveryId?: string
-  readonly jobId?: string
-  readonly runId?: string
-  readonly firedAt?: string
-  readonly receivedAt?: string
-  readonly completedAt?: string
-  readonly target: string
-  readonly secretRef?: string
-  /** Attempts performed so far (1 = the initial try already failed). */
-  attempts: number
-  /** Epoch ms at which the next attempt may run. */
-  nextDueAt: number
-  readonly lastError?: string
-}
-
-const STORE_VERSION = 2
-
-/** Deliveries retained per hook. */
-const MAX_DELIVERIES_PER_HOOK = 50
-
-/** Outbound callback attempts retained globally. */
-const MAX_CALLBACK_LOG = 100
-
-/** Pending callback retries retained in the store queue. */
-const MAX_PENDING_RETRIES = 100
-
-/** Raw bodies retained for replay. */
-const MAX_STORED_PAYLOAD_BYTES = 8_192
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
-}
-
-function isValidHook(value: unknown): value is WebhookHook {
-  if (!isRecord(value)) return false
-  if (typeof value.id !== 'string' || typeof value.name !== 'string') return false
-  if (typeof value.promptTemplate !== 'string' || typeof value.createdAt !== 'string') return false
-  if (value.target !== null && typeof value.target !== 'string') return false
-  if (value.createdBy !== null && typeof value.createdBy !== 'string') return false
-  if (typeof value.deliveryCount !== 'number') return false
-  if (value.lastDeliveryAt !== null && typeof value.lastDeliveryAt !== 'string') return false
-  if (value.paused !== undefined && typeof value.paused !== 'boolean') return false
-  const auth = value.auth
-  if (!isRecord(auth)) return false
-  if (auth.kind === 'none') return true
-  if (auth.kind === 'hmac-sha256' || auth.kind === 'bearer') return typeof auth.secretRef === 'string'
-  return false
-}
-
-function isValidDelivery(value: unknown): value is WebhookDelivery {
-  if (!isRecord(value)) return false
-  if (typeof value.id !== 'string' || typeof value.hookId !== 'string') return false
-  if (typeof value.receivedAt !== 'string' || typeof value.payloadExcerpt !== 'string') return false
-  if (value.eventId !== null && typeof value.eventId !== 'string') return false
-  if (!isRecord(value.headers)) return false
-  return value.status === 'accepted' || value.status === 'rejected'
-    || value.status === 'delivered' || value.status === 'held'
-}
-
-function isValidCallbackEntry(value: unknown): value is CallbackLogEntry {
-  if (!isRecord(value)) return false
-  if (typeof value.id !== 'string' || typeof value.subject !== 'string') return false
-  if (typeof value.target !== 'string' || typeof value.sentAt !== 'string') return false
-  if (value.source !== 'webhook' && value.source !== 'cron') return false
-  if (value.status !== 'sent' && value.status !== 'failed') return false
-  if (value.attempt !== undefined && (typeof value.attempt !== 'number' || !Number.isSafeInteger(value.attempt) || value.attempt < 1)) return false
-  return value.error === undefined || typeof value.error === 'string'
-}
-
-function isValidRetry(value: unknown): value is PendingRetry {
-  if (!isRecord(value)) return false
-  if (typeof value.id !== 'string' || typeof value.subject !== 'string') return false
-  if (typeof value.target !== 'string') return false
-  if (value.source !== 'webhook' && value.source !== 'cron') return false
-  if (typeof value.nextDueAt !== 'number' || !Number.isSafeInteger(value.nextDueAt)) return false
-  if (typeof value.attempts !== 'number' || !Number.isSafeInteger(value.attempts) || value.attempts < 1) return false
-  if (value.eventId !== undefined && value.eventId !== null && typeof value.eventId !== 'string') return false
-  if (value.secretRef !== undefined && typeof value.secretRef !== 'string') return false
-  for (const key of ['status', 'outcome', 'excerpt', 'hookId', 'deliveryId', 'jobId', 'runId', 'firedAt', 'receivedAt', 'completedAt', 'lastError'] as const) {
-    if (value[key] !== undefined && typeof value[key] !== 'string') return false
-  }
-  return true
-}
 
 /**
  * JSON-file store for hooks and deliveries. Writes are atomic; a corrupt file
@@ -233,10 +52,13 @@ export class WebhookStore {
   private readonly baseRetries = new Map<string, string>()
   /** Records we dropped since our last load; a merge must not resurrect them. */
   private readonly deletedIds = new Set<string>()
+  private eventSeq = 0
+  private loadedVersion = STORE_VERSION
 
   constructor(
     private readonly filePath: string,
     private readonly warn: (message: string) => void,
+    private readonly fallbackTarget?: AutomationTarget,
   ) {
     this.writeLockDir = join(dirname(filePath), 'store.lock')
     this.seqFile = `${filePath}.seq`
@@ -253,6 +75,7 @@ export class WebhookStore {
     }
     this.lastWritten = raw
     this.applyRaw(raw, false)
+    if (this.loadedVersion < STORE_VERSION) this.persist()
   }
 
   /**
@@ -270,7 +93,7 @@ export class WebhookStore {
       this.warn(`dsh-webhook: corrupt store moved to ${quarantine}; starting empty`)
       return
     }
-    if (!isRecord(parsed) || parsed.version !== STORE_VERSION
+    if (!isRecord(parsed) || (parsed.version !== 2 && parsed.version !== STORE_VERSION)
       || !Array.isArray(parsed.hooks) || !Array.isArray(parsed.deliveries)) {
       if (hot) {
         this.warn(`dsh-webhook: unsupported store format in ${this.filePath}; keeping current state`)
@@ -286,10 +109,10 @@ export class WebhookStore {
         continue
       }
       ids.add(entry.id)
-      hooks.push({ ...entry, paused: entry.paused ?? false })
+      hooks.push(normalizeHook(entry, this.fallbackTarget))
     }
     this.hookList = hooks
-    this.deliveryList = parsed.deliveries.filter((entry: unknown) => isValidDelivery(entry))
+    this.deliveryList = parsed.deliveries.filter((entry: unknown) => isValidDelivery(entry)).map(normalizeDelivery)
     this.callbackLogList = Array.isArray(parsed.callbacks)
       ? parsed.callbacks.filter((entry: unknown) => isValidCallbackEntry(entry))
       : []
@@ -297,6 +120,8 @@ export class WebhookStore {
       ? parsed.retries.filter((entry: unknown) => isValidRetry(entry))
       : []
     this.seq = typeof parsed.seq === 'number' && Number.isSafeInteger(parsed.seq) ? parsed.seq : hooks.length
+    this.eventSeq = typeof parsed.eventCursor === 'number' && Number.isSafeInteger(parsed.eventCursor) ? parsed.eventCursor : 0
+    this.loadedVersion = Number(parsed.version)
     this.rebaseSnapshots()
     const sidecar = this.readSeqSidecar()
     if (sidecar !== null && sidecar > this.seq) this.seq = sidecar
@@ -375,17 +200,12 @@ export class WebhookStore {
    */
   allocateId(prefix: string): string {
     mkdirSync(dirname(this.filePath), { recursive: true })
-    const lock = acquireDirLock(this.writeLockDir)
+    const lock = acquireStoreWriteLock(this.writeLockDir)
     try {
-      if (!lock.acquired) {
-        this.reportLock(lock)
-        this.seq += 1
-      } else {
-        const diskSeq = this.readSeqSidecar()
-        if (diskSeq !== null && diskSeq > this.seq) this.seq = diskSeq
-        this.seq += 1
-        this.writeSeqSidecar()
-      }
+      const diskSeq = this.readSeqSidecar()
+      if (diskSeq !== null && diskSeq > this.seq) this.seq = diskSeq
+      this.seq += 1
+      this.writeSeqSidecar()
     } finally {
       lock.release()
     }
@@ -435,11 +255,21 @@ export class WebhookStore {
     this.deliveryList.push(delivery)
     const mine = this.deliveryList.filter(entry => entry.hookId === delivery.hookId)
     if (mine.length > MAX_DELIVERIES_PER_HOOK) {
-      const overflow = mine.slice(0, mine.length - MAX_DELIVERIES_PER_HOOK)
+      const overflow = mine.filter(entry => terminalDelivery(entry)).slice(0, mine.length - MAX_DELIVERIES_PER_HOOK)
       const overflowIds = new Set(overflow.map(entry => entry.id))
       for (const id of overflowIds) this.deletedIds.add(id)
       this.deliveryList = this.deliveryList.filter(entry => !overflowIds.has(entry.id))
     }
+    this.persist()
+  }
+
+  eventCursor(): number {
+    return this.eventSeq
+  }
+
+  advanceEventCursor(seq: number): void {
+    if (!Number.isSafeInteger(seq) || seq < this.eventSeq) throw new Error('dsh-webhook: event cursor cannot move backwards')
+    this.eventSeq = seq
     this.persist()
   }
 
@@ -538,14 +368,9 @@ export class WebhookStore {
    */
   private persist(): void {
     mkdirSync(dirname(this.filePath), { recursive: true })
-    const lock = acquireDirLock(this.writeLockDir)
+    const lock = acquireStoreWriteLock(this.writeLockDir)
     try {
-      if (lock.acquired) {
-        this.writeSnapshot(this.mergeFromDisk())
-      } else {
-        this.reportLock(lock)
-        this.writeSnapshot(null)
-      }
+      this.writeSnapshot(this.mergeFromDisk())
     } finally {
       lock.release()
     }
@@ -556,17 +381,22 @@ export class WebhookStore {
    * @param merged - the merged record lists when an external write was
    *   folded in, or null to write our in-memory state as-is.
    */
-  private writeSnapshot(merged: { hooks: WebhookHook[]; deliveries: WebhookDelivery[]; callbacks: CallbackLogEntry[]; retries: PendingRetry[] } | null): void {
+  private writeSnapshot(merged: StoreSnapshot | null): void {
     const hooks = merged?.hooks ?? this.hookList
     const deliveries = merged?.deliveries ?? this.deliveryList
     const callbacks = merged?.callbacks ?? this.callbackLogList
     const retries = merged?.retries ?? this.retryList
     if (merged !== null) {
+      this.hookList = hooks
+      this.deliveryList = deliveries
+      this.callbackLogList = callbacks
+      this.retryList = retries
       this.seq = WebhookStore.maxSeq(this.seq, [...hooks, ...deliveries, ...callbacks, ...retries])
     }
     const payload = JSON.stringify({
       version: STORE_VERSION,
       seq: this.seq,
+      eventCursor: this.eventSeq,
       hooks,
       deliveries,
       callbacks,
@@ -608,7 +438,7 @@ export class WebhookStore {
    * Returns null when the file is absent, unchanged since our last write, or
    * unreadable — in all of which cases our in-memory state is written as-is.
    */
-  private mergeFromDisk(): { hooks: WebhookHook[]; deliveries: WebhookDelivery[]; callbacks: CallbackLogEntry[]; retries: PendingRetry[] } | null {
+  private mergeFromDisk(): StoreSnapshot | null {
     let raw: string
     try {
       raw = readFileSync(this.filePath, 'utf8')
@@ -626,18 +456,18 @@ export class WebhookStore {
       this.warn('dsh-webhook: external store content is corrupt; writing local state over it')
       return null
     }
-    if (!isRecord(parsed) || parsed.version !== STORE_VERSION
+    if (!isRecord(parsed) || (parsed.version !== 2 && parsed.version !== STORE_VERSION)
       || !Array.isArray(parsed.hooks) || !Array.isArray(parsed.deliveries)) {
       this.warn('dsh-webhook: unsupported external store format; writing local state over it')
       return null
     }
     const diskHooks = new Map<string, WebhookHook>()
     for (const entry of parsed.hooks) {
-      if (isValidHook(entry)) diskHooks.set(entry.id, { ...entry, paused: entry.paused ?? false })
+      if (isValidHook(entry)) diskHooks.set(entry.id, normalizeHook(entry, this.fallbackTarget))
     }
     const diskDeliveries = new Map<string, WebhookDelivery>()
     for (const entry of parsed.deliveries) {
-      if (isValidDelivery(entry)) diskDeliveries.set(entry.id, entry)
+      if (isValidDelivery(entry)) diskDeliveries.set(entry.id, normalizeDelivery(entry))
     }
     const diskCallbacks = new Map<string, CallbackLogEntry>()
     if (Array.isArray(parsed.callbacks)) {
@@ -652,11 +482,13 @@ export class WebhookStore {
       }
     }
     const diskSeq = typeof parsed.seq === 'number' && Number.isSafeInteger(parsed.seq) ? parsed.seq : 0
+    const diskEventSeq = typeof parsed.eventCursor === 'number' && Number.isSafeInteger(parsed.eventCursor) ? parsed.eventCursor : 0
     const hooks = mergeRecords(this.hookList, this.baseHooks, diskHooks, this.deletedIds)
     const deliveries = mergeRecords(this.deliveryList, this.baseDeliveries, diskDeliveries, this.deletedIds)
     const callbacks = mergeRecords(this.callbackLogList, this.baseCallbacks, diskCallbacks, this.deletedIds)
     const retries = mergeRecords(this.retryList, this.baseRetries, diskRetries, this.deletedIds)
     this.seq = WebhookStore.maxSeq(Math.max(this.seq, diskSeq), [...hooks, ...deliveries, ...callbacks, ...retries])
+    this.eventSeq = Math.max(this.eventSeq, diskEventSeq)
     return { hooks, deliveries, callbacks, retries }
   }
 
@@ -730,45 +562,13 @@ export class WebhookStore {
   }
 }
 
-/**
- * Merge one record list with the current disk state. Per-record semantics:
- *
- * - a record only the other side has is adopted, in the disk order;
- * - a record we created or edited wins over the other side's version
- *   (last-writer-wins on the record);
- * - a record we have not touched since our last load or write takes the
- *   other side's version, or is dropped when the other side deleted it;
- * - records only we hold are appended after the disk records;
- * - a record we dropped (in `deleted`) is never resurrected.
- */
-function mergeRecords<T extends { id: string }>(
-  ours: readonly T[],
-  base: ReadonlyMap<string, string>,
-  latest: ReadonlyMap<string, T>,
-  deleted: ReadonlySet<string>,
-): T[] {
-  const merged: T[] = []
-  const seen = new Set<string>()
-  const byId = new Map<string, T>()
-  for (const record of ours) byId.set(record.id, record)
-  for (const [id, current] of latest) {
-    if (deleted.has(id)) continue
-    seen.add(id)
-    const our = byId.get(id)
-    if (our === undefined) {
-      merged.push(current)
-    } else if (JSON.stringify(our) === base.get(id)) {
-      merged.push(current)
-    } else {
-      merged.push(our)
-    }
-  }
-  for (const record of ours) {
-    if (seen.has(record.id) || deleted.has(record.id)) continue
-    if (JSON.stringify(record) === base.get(record.id)) continue
-    merged.push(record)
-  }
-  return merged
-}
+const storeLockWait = new Int32Array(new SharedArrayBuffer(4))
 
-export { MAX_STORED_PAYLOAD_BYTES }
+function acquireStoreWriteLock(lockDir: string): DirLock {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const lock = acquireDirLock(lockDir)
+    if (lock.acquired) return lock
+    Atomics.wait(storeLockWait, 0, 0, 5)
+  }
+  throw new Error(`dsh-webhook: timed out acquiring store write lock ${lockDir}`)
+}

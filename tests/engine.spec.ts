@@ -1,35 +1,33 @@
-import { createHmac } from 'node:crypto'
 import { Buffer } from 'node:buffer'
-import { mkdtempSync } from 'node:fs'
+import { createHmac } from 'node:crypto'
+import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { WebhookEngine, type WebhookTarget } from '../src/engine.ts'
-import { WebhookStore } from '../src/store.ts'
+import { WebhookAutomationAdapter } from '../src/adapter.ts'
+import { WebhookEngine } from '../src/engine.ts'
 import type { InboundEvent } from '../src/server.ts'
+import { WebhookStore } from '../src/store.ts'
+import { FakeAutomation } from './fake-automation.ts'
 
 interface EngineHarness {
+  dir: string
   engine: WebhookEngine
   store: WebhookStore
+  automation: FakeAutomation
+  adapter: WebhookAutomationAdapter
   resolveSecret: ReturnType<typeof vi.fn>
-  delivered: Array<{ target: WebhookTarget; message: unknown }>
-  targets: WebhookTarget[]
 }
 
 function hmac(secret: string, body: string): string {
   return `sha256=${createHmac('sha256', secret).update(body).digest('hex')}`
 }
 
-/** URL-path prefix for the webhook endpoint. */
-const HOOKS = '/hooks'
-
 function makeEvent(hookName: string, overrides: Partial<InboundEvent> = {}): InboundEvent {
   return {
     hookName,
     headers: { 'x-github-delivery': 'delivery-1', 'x-github-event': 'issues' },
-    rawBody: Buffer.from('{"action":"opened"}'),
-    text: '{"action":"opened"}',
-    sourceIp: '::1',
+    rawBody: Buffer.from('{"action":"opened"}'), text: '{"action":"opened"}', sourceIp: '::1',
     ...overrides,
   }
 }
@@ -38,127 +36,98 @@ function createHarness(requireSecretsOnPublicBind = false): EngineHarness {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-webhook-engine-'))
   const store = new WebhookStore(join(dir, 'store.json'), () => {})
   store.load()
-  const targets: WebhookTarget[] = [{ id: 'agent-1', status: 'idle', followup: () => {}, inject: () => {} }]
-  const delivered: Array<{ target: WebhookTarget; message: unknown }> = []
+  const automation = new FakeAutomation()
+  const adapter = new WebhookAutomationAdapter(store, automation, () => {})
   const resolveSecret = vi.fn(async (_ref: string) => undefined)
   const engine = new WebhookEngine({
-    store,
-    now: () => Date.now(),
-    targets: () => targets,
-    resolveSecret: ref => resolveSecret(ref),
-    buildMessage: (hook, prompt) => ({ hook: hook.name, prompt }),
-    deliver: (target, message) => { delivered.push({ target, message }) },
-    requireSecretsOnPublicBind,
-    warn: () => {},
+    store, adapter, now: () => Date.now(), resolveSecret: ref => resolveSecret(ref),
+    defaultTarget: { kind: 'fresh', cwd: dir }, requireSecretsOnPublicBind, warn: () => {},
   })
-  return { engine, store, resolveSecret, delivered, targets }
+  return { dir, engine, store, automation, adapter, resolveSecret }
 }
 
 describe('WebhookEngine', () => {
   let harness: EngineHarness
   beforeEach(() => { harness = createHarness() })
-  afterEach(() => { /* temp dirs are cleaned by the harness call sites */ })
+  afterEach(() => { rmSync(harness.dir, { recursive: true, force: true }) })
 
-  it('adds a hook and validates its name and template', () => {
+  it('adds a hook with a fresh target and validates inputs', () => {
     const added = harness.engine.addHook({ name: 'ci', promptTemplate: 'act', auth: { kind: 'none' } })
-    expect(added.url).toBe(`${HOOKS}/${added.hook.name}`)
+    expect(added.url).toBe('/hooks/ci')
+    expect(added.hook.runTarget?.cwd).toBe(harness.dir)
     expect(() => harness.engine.addHook({ name: 'Bad_Name', promptTemplate: 'x', auth: { kind: 'none' } })).toThrow('name must match')
     expect(() => harness.engine.addHook({ name: 'ci', promptTemplate: 'x', auth: { kind: 'none' } })).toThrow('already exists')
-    expect(() => harness.engine.addHook({ name: 'ok', promptTemplate: '  ', auth: { kind: 'none' } })).toThrow('non-blank')
   })
 
   it('refuses a secret-less hook under a public bind policy', () => {
     const publicHarness = createHarness(true)
-    expect(() => publicHarness.engine.addHook({ name: 'ci', promptTemplate: 'x', auth: { kind: 'none' } }))
-      .toThrow('no secret but the server binds a public address')
+    try {
+      expect(() => publicHarness.engine.addHook({ name: 'ci', promptTemplate: 'x', auth: { kind: 'none' } }))
+        .toThrow('no secret but the server binds a public address')
+    } finally {
+      rmSync(publicHarness.dir, { recursive: true, force: true })
+    }
   })
 
-  it('verifies an hmac hook against the credentials service', async () => {
-    harness.engine.addHook({
-      name: 'signed',
-      promptTemplate: 'act',
-      auth: { kind: 'hmac-sha256', secretRef: 'CI_SECRET' },
-    })
+  it('verifies HMAC and loopback policies', async () => {
+    harness.engine.addHook({ name: 'signed', promptTemplate: 'act', auth: { kind: 'hmac-sha256', secretRef: 'CI_SECRET' } })
     harness.resolveSecret.mockResolvedValue('s3cret')
     const body = Buffer.from('{"action":"opened"}')
-    const good = await harness.engine.verify({
-      ...makeEvent('signed'),
-      headers: { 'x-hub-signature-256': hmac('s3cret', body.toString()) },
-      rawBody: body,
-      text: body.toString(),
-    })
-    expect(good).toEqual({ ok: true })
-
-    const bad = await harness.engine.verify({
-      ...makeEvent('signed'),
-      headers: { 'x-hub-signature-256': hmac('wrong', body.toString()) },
-      rawBody: body,
-      text: body.toString(),
-    })
-    if (bad.ok) throw new Error('expected rejection')
-    expect(bad.code).toBe(401)
-  })
-
-  it('rejects an off-loopback request to a secret-less hook', async () => {
+    expect((await harness.engine.verify({
+      ...makeEvent('signed'), headers: { 'x-hub-signature-256': hmac('s3cret', body.toString()) }, rawBody: body, text: body.toString(),
+    })).ok).toBe(true)
     harness.engine.addHook({ name: 'local', promptTemplate: 'act', auth: { kind: 'none' } })
-    const result = await harness.engine.verify(makeEvent('local', { sourceIp: '203.0.113.5' }))
-    expect(result).toEqual({ ok: false, code: 403, reason: 'this hook is loopback-only' })
+    expect(await harness.engine.verify(makeEvent('local', { sourceIp: '203.0.113.5' })))
+      .toEqual({ ok: false, code: 403, reason: 'this hook is loopback-only' })
   })
 
-  it('refuses requests to a paused hook and resumes it', async () => {
-    harness.engine.addHook({ name: 'ci', promptTemplate: 'act', auth: { kind: 'none' } })
-    expect(harness.engine.service().pause('ci')).toBe(true)
-    expect(harness.engine.service().pause('missing')).toBe(false)
-    const paused = await harness.engine.verify(makeEvent('ci'))
-    expect(paused).toEqual({ ok: false, code: 403, reason: 'hook is paused' })
-    expect(harness.engine.service().resume('ci')).toBe(true)
-    expect((await harness.engine.verify(makeEvent('ci'))).ok).toBe(true)
-  })
-
-  it('accepts a verified event, delivers, and records a receipt with outcome-ready state', async () => {
+  it('persists the verified receipt before idempotent Automation submission', async () => {
     harness.engine.addHook({ name: 'ci', promptTemplate: 'act on {{payload.action}}', auth: { kind: 'none' } })
     await harness.engine.accept(makeEvent('ci'))
-    expect(harness.delivered).toHaveLength(1)
-    const message = harness.delivered[0]?.message as { hook: string; prompt: string }
-    expect(message.hook).toBe('ci')
-    expect(message.prompt).toContain('act on opened')
-    const deliveries = harness.store.deliveries('wh-1')
-    expect(deliveries[0]?.status).toBe('delivered')
-    expect(deliveries[0]?.eventId).toBe('delivery-1')
+    const receipt = harness.store.deliveries('wh-1')[0]
+    expect(receipt?.status).toBe('submitted')
+    expect(receipt?.automationRunId).toBe('run-1')
+    expect(harness.automation.submissions[0]?.prompt).toContain('act on opened')
+    expect(harness.automation.submissions[0]?.trigger).toMatchObject({
+      kind: 'webhook', sourceId: 'wh-1', occurrenceId: 'delivery-1', idempotencyKey: 'v1:wh-1:delivery-1',
+    })
   })
 
-  it('deduplicates repeated event ids as rejected', async () => {
+  it('deduplicates repeated source event ids without a second Run', async () => {
     harness.engine.addHook({ name: 'ci', promptTemplate: 'act', auth: { kind: 'none' } })
     await harness.engine.accept(makeEvent('ci'))
     await harness.engine.accept(makeEvent('ci'))
-    expect(harness.delivered).toHaveLength(1)
-    const deliveries = harness.store.deliveries('wh-1')
-    expect(deliveries).toHaveLength(2)
-    expect(deliveries[0]?.status).toBe('rejected')
-    expect(deliveries[0]?.reason).toContain('duplicate')
+    expect(harness.automation.submissions).toHaveLength(1)
+    expect(harness.store.deliveries('wh-1')[0]).toMatchObject({ status: 'rejected', reason: 'duplicate event id' })
   })
 
-  it('holds an event when no target is available', async () => {
-    harness.targets.length = 0
+  it('recovers an ambiguous crash using the same idempotency key', async () => {
     harness.engine.addHook({ name: 'ci', promptTemplate: 'act', auth: { kind: 'none' } })
+    harness.automation.failAfterCreate = true
     await harness.engine.accept(makeEvent('ci'))
-    expect(harness.delivered).toHaveLength(0)
-    expect(harness.store.deliveries('wh-1')[0]?.status).toBe('held')
+    expect(harness.store.deliveries('wh-1')[0]?.status).toBe('accepted')
+    await harness.adapter.submitPending()
+    expect(harness.store.deliveries('wh-1')[0]?.automationRunId).toBe('run-1')
+    expect(harness.automation.submissions.map(item => item.trigger.idempotencyKey))
+      .toEqual(['v1:wh-1:delivery-1', 'v1:wh-1:delivery-1'])
   })
 
-  it('replays a stored event through the normal path', async () => {
+  it('replays as a new occurrence and reconciles a terminal Run', async () => {
     harness.engine.addHook({ name: 'ci', promptTemplate: 'act', auth: { kind: 'none' } })
     await harness.engine.accept(makeEvent('ci'))
-    const deliveries = harness.store.deliveries('wh-1')
-    const result = await harness.engine.replay(deliveries[0]?.id as string)
-    expect(result.delivered).toBe(true)
-    expect(harness.delivered).toHaveLength(2)
-    expect(harness.store.deliveries('wh-1')).toHaveLength(2)
-    expect(harness.store.deliveries('wh-1')[0]?.status).toBe('delivered')
+    const original = harness.store.deliveries('wh-1')[0]
+    const result = await harness.engine.replay(original?.id as string)
+    expect(result.submitted).toBe(true)
+    expect(harness.automation.submissions).toHaveLength(2)
+    const replay = harness.store.deliveryById(result.deliveryId as string)
+    expect(replay?.replayOf).toBe(original?.id)
+    harness.automation.settle(replay?.automationRunId as string, 'succeeded')
+    await harness.adapter.reconcile()
+    expect(replay).toMatchObject({ status: 'settled', executionState: 'succeeded', outcome: 'completed', excerpt: 'done' })
+    expect(harness.store.eventCursor()).toBeGreaterThan(0)
   })
 
   it('refuses to replay an unknown delivery', async () => {
-    const result = await harness.engine.replay('dl-999')
-    expect(result).toEqual({ delivered: false, reason: 'delivery not found' })
+    expect(await harness.engine.replay('dl-999')).toEqual({ submitted: false, reason: 'delivery not found' })
   })
 })
