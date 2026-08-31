@@ -10,9 +10,12 @@ describe('host bundle manifest', () => {
     expect(manifest.dsh.bundle.patch).toBe('./cordis.patch.yml')
   })
 
-  it('keeps every dependency an optional peer', () => {
+  it('keeps host packages optional while requiring the Automation control plane', () => {
     for (const name of Object.keys(manifest.peerDependencies)) {
+      if (name === 'dsh-automation') continue
       expect(manifest.peerDependenciesMeta[name]?.optional, name).toBe(true)
     }
+    expect(manifest.peerDependencies['dsh-automation']).toBe('>=0.2.0-alpha.0 <0.3.0')
+    expect(manifest.peerDependenciesMeta['dsh-automation']).toBeUndefined()
   })
 })

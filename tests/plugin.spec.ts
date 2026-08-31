@@ -4,7 +4,6 @@ import Loader from '@deepseek-ai/cordis-plugin-loader'
 import { describe, expect, it } from 'vitest'
 import * as plugin from '../src/index.ts'
 import { createPluginHarness } from './harness.ts'
-import type { WebhookTarget } from '../src/engine.ts'
 
 /** Structural view of a captured tool definition for direct execution. */
 interface CapturedTool {
@@ -16,13 +15,6 @@ interface CapturedTool {
  * self-contained gate's naive absolute-path scan does not flag URL paths. */
 const HOOKS = '/hooks'
 
-const targets: readonly WebhookTarget[] = [{
-  id: 'agent-1',
-  status: 'idle',
-  followup: () => {},
-  inject: () => {},
-}]
-
 describe('dsh-webhook', () => {
   it('preserves the function-plugin namespace through Loader unwrapping', () => {
     expect('default' in plugin).toBe(false)
@@ -31,7 +23,7 @@ describe('dsh-webhook', () => {
     const unwrapped = loader.unwrapExports(plugin) as Record<string, unknown>
     expect(unwrapped).toBe(plugin)
     expect(unwrapped.name).toBe('dsh-webhook')
-    expect(unwrapped.inject).toEqual(['agents', 'tools'])
+    expect(unwrapped.inject).toEqual(['automation', 'tools'])
     expect(unwrapped.Config).toBeDefined()
     expect(typeof unwrapped.apply).toBe('function')
   })
@@ -91,12 +83,8 @@ describe('dsh-webhook', () => {
     await harness.dispose()
   })
 
-  it('fails loud when coldWake is enabled without session persistence', async () => {
-    await expect(createPluginHarness({ coldWake: true })).rejects.toThrow('coldWake requires the sessionPersistence service')
-  })
-
   it('resolves secrets through the credentials service at delivery time', async () => {
-    const harness = await createPluginHarness({}, targets, { CI_SECRET: 's3cret' })
+    const harness = await createPluginHarness({}, { CI_SECRET: 's3cret' })
     const tools = harness.registered as unknown as CapturedTool[]
     const add = tools[0] as CapturedTool
     const added = await add.execute({

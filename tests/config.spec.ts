@@ -15,8 +15,7 @@ describe('dsh-webhook config', () => {
     expect(resolved.port).toBe(8788)
     expect(resolved.maxPayloadBytes).toBe(262_144)
     expect(resolved.rateLimitPerMinute).toBe(60)
-    expect(resolved.busyDelivery).toBe('followup')
-    expect(resolved.coldWake).toBe(false)
+    expect(resolved.reconcilePollMs).toBe(1_000)
     expect(resolved.callbackRetries).toBe(4)
   })
 

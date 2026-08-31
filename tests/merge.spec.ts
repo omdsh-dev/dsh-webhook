@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { WebhookStore, type WebhookHook, type WebhookDelivery } from '../src/store.ts'
 
 function makeHook(id: string, name: string): WebhookHook {
@@ -11,6 +11,8 @@ function makeHook(id: string, name: string): WebhookHook {
     promptTemplate: 'act on {{payload.x}}',
     auth: { kind: 'none' },
     target: null,
+    runTarget: { kind: 'fresh', cwd: '/workspace' },
+    concurrencyLimit: 1,
     createdBy: null,
     createdAt: '2026-08-16T00:00:00.000Z',
     deliveryCount: 0,
@@ -59,6 +61,19 @@ describe('WebhookStore cross-process merge', () => {
     a.insertHook(makeHook(a.allocateId('wh'), 'ci'))
     b.insertHook(makeHook(b.allocateId('wh'), 'deploy'))
     expect(reload().hooks().map(hook => hook.name).sort()).toEqual(['ci', 'deploy'])
+  })
+
+  it('keeps an adopted peer record across a second local write', () => {
+    const a = new WebhookStore(file, () => {})
+    const b = new WebhookStore(file, () => {})
+    a.load()
+    b.load()
+    a.insertHook(makeHook(a.allocateId('wh'), 'ci'))
+    b.insertHook(makeHook(b.allocateId('wh'), 'deploy'))
+    b.hookByName('deploy')!.paused = true
+    b.flush()
+    expect(reload().hooks().map(hook => hook.name).sort()).toEqual(['ci', 'deploy'])
+    expect(reload().hookByName('deploy')?.paused).toBe(true)
   })
 
   it('keeps an in-place edit by one side when the peer persists', () => {
@@ -157,14 +172,12 @@ describe('WebhookStore cross-process merge', () => {
     expect(deliveries[0]?.id).toBe('dl-62')
   })
 
-  it('persists anyway with a warning when the write lock is held elsewhere', () => {
-    const warn = vi.fn()
+  it('fails closed instead of overwriting peer state when the write lock cannot be acquired', () => {
     mkdirSync(join(dir, 'store.lock'))
     writeFileSync(join(dir, 'store.lock', 'pid'), String(process.pid))
-    const store = new WebhookStore(file, warn)
+    const store = new WebhookStore(file, () => {})
     store.load()
-    store.insertHook(makeHook(store.allocateId('wh'), 'ci'))
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining('store write lock'))
-    expect(reload().hooks().map(hook => hook.name)).toEqual(['ci'])
+    expect(() => store.allocateId('wh')).toThrow('timed out acquiring store write lock')
+    expect(reload().hooks()).toEqual([])
   })
 })

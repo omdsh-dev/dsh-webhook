@@ -7,6 +7,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { CommandResult } from '@deepseek-ai/dsh-commands'
 import type { WebhookEngine } from './engine.ts'
 import type { WebhookHook } from './store.ts'
+import { targetFromAgent } from './target.ts'
 
 const USAGE = [
   'Usage:',
@@ -24,7 +25,7 @@ function formatHook(hook: WebhookHook): string {
   const auth = hook.auth.kind === 'none'
     ? 'no secret (loopback only)'
     : `${hook.auth.kind} ${hook.auth.secretRef}${hook.auth.header !== undefined ? ` (${hook.auth.header})` : ''}`
-  const target = hook.target === null ? '' : `  target ${hook.target}`
+  const target = hook.runTarget === null ? '  TARGET REQUIRED' : `  cwd ${hook.runTarget.cwd}`
   const last = hook.lastDeliveryAt === null ? '' : `  last ${hook.lastDeliveryAt}`
   const state = hook.paused ? '  PAUSED' : ''
   return `${hook.name}${state}  ${auth}  deliveries ${hook.deliveryCount}${last}${target}  ${hook.promptTemplate}`
@@ -68,7 +69,7 @@ export function registerWebhookCommand(ctx: Context, engine: WebhookEngine): () 
         const id = input.slice('replay '.length).trim()
         if (id.length === 0) return { kind: 'error', text: USAGE }
         void engine.replay(id).then(result => {
-          if (!result.delivered) ctx.logger.warn(`dsh-webhook: replay of ${id} not delivered: ${result.reason ?? 'unknown'}`)
+          if (!result.submitted) ctx.logger.warn(`dsh-webhook: replay of ${id} not submitted: ${result.reason ?? 'unknown'}`)
         })
         return { kind: 'success', text: `Replay of ${id} started.` }
       }
@@ -118,6 +119,7 @@ export function registerWebhookCommand(ctx: Context, engine: WebhookEngine): () 
                 ? { kind: 'bearer', secretRef, ...(header === undefined ? {} : { header }) }
                 : { kind: 'hmac-sha256', secretRef, ...(header === undefined ? {} : { header }) },
             createdBy,
+            target: targetFromAgent(agent),
           })
           return { kind: 'success', text: `Added ${formatHook(result.hook)} at POST ${result.url}` }
         } catch (error) {

@@ -18,8 +18,10 @@ export interface StaticHook {
   secretRef?: string
   /** Custom header name carrying the signature or token. */
   header?: string
-  /** Preferred delivery target session id, optional. */
-  target?: string | null
+  /** Absolute workspace for the fresh Automation Session. */
+  cwd?: string
+  /** Maximum concurrent Runs from this hook; defaults to one. */
+  concurrencyLimit?: number
   /** Requests are refused while paused. */
   paused?: boolean
   /** Hook-level outbound callbacks fired when a delivery settles. */
@@ -35,10 +37,10 @@ export interface Config {
   readonly maxPayloadBytes?: number
   /** Per-hook accepted-request budget per minute. */
   readonly rateLimitPerMinute?: number
-  /** Delivery mode into a busy target: follow-up turn, or injected notice. */
-  readonly busyDelivery?: 'followup' | 'inject'
-  /** Resume a cold creating session for delivery. */
-  readonly coldWake?: boolean
+  /** Default absolute workspace for hooks that do not supply a target. */
+  readonly defaultCwd?: string
+  /** Durable Automation event-feed reconciliation interval. */
+  readonly reconcilePollMs?: number
   /** Data directory; defaults to `$DSH_HOME/webhook`. */
   readonly dataDir?: string
   /** Static hooks installed on load. */
@@ -58,8 +60,8 @@ export interface ResolvedConfig {
   readonly port: number
   readonly maxPayloadBytes: number
   readonly rateLimitPerMinute: number
-  readonly busyDelivery: 'followup' | 'inject'
-  readonly coldWake: boolean
+  readonly defaultCwd?: string
+  readonly reconcilePollMs: number
   readonly dataDir: string | null
   readonly hooks: readonly StaticHook[]
   readonly callbacks: readonly CallbackRule[]
@@ -77,7 +79,8 @@ const staticHookSchema = z.object({
   authKind: z.union([z.const('none'), z.const('hmac-sha256'), z.const('bearer')]).default('none'),
   secretRef: z.string(),
   header: z.string(),
-  target: z.string(),
+  cwd: z.string(),
+  concurrencyLimit: z.number().step(1).min(1).max(1_000).default(1),
   paused: z.boolean(),
   callbacks: z.array(z.object({
     target: z.string(),
@@ -106,8 +109,8 @@ export const Config = z.object({
   port: z.natural().max(65535).default(8788),
   maxPayloadBytes: z.natural().default(262_144),
   rateLimitPerMinute: z.natural().default(60),
-  busyDelivery: z.union([z.const('followup'), z.const('inject')]).default('followup'),
-  coldWake: z.boolean().default(false),
+  defaultCwd: z.string(),
+  reconcilePollMs: z.number().step(1).min(100).max(60_000).default(1_000),
   dataDir: z.string(),
   hooks: z.array(staticHookSchema),
   callbacks: z.array(callbackRuleSchema),
@@ -137,8 +140,8 @@ export function resolveConfig(config: Config): ResolvedConfig {
     port,
     maxPayloadBytes,
     rateLimitPerMinute,
-    busyDelivery: config.busyDelivery ?? 'followup',
-    coldWake: config.coldWake ?? false,
+    ...(config.defaultCwd === undefined ? {} : { defaultCwd: config.defaultCwd }),
+    reconcilePollMs: config.reconcilePollMs ?? 1_000,
     dataDir: config.dataDir ?? null,
     hooks: config.hooks ?? [],
     callbacks,

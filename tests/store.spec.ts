@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -11,6 +11,8 @@ function makeHook(id: string, name: string): WebhookHook {
     promptTemplate: 'act on {{payload.x}}',
     auth: { kind: 'none' },
     target: null,
+    runTarget: { kind: 'fresh', cwd: '/workspace' },
+    concurrencyLimit: 1,
     createdBy: null,
     createdAt: '2026-08-16T00:00:00.000Z',
     deliveryCount: 0,
@@ -49,6 +51,19 @@ describe('WebhookStore', () => {
     const store = new WebhookStore(file, () => {})
     store.load()
     expect(store.hooks()).toEqual([])
+  })
+
+  it('migrates v2 hooks to fresh targets and persists the v3 cursor schema', () => {
+    writeFileSync(file, JSON.stringify({
+      version: 2, seq: 1,
+      hooks: [{ ...makeHook('wh-1', 'legacy'), runTarget: undefined, concurrencyLimit: undefined }],
+      deliveries: [], callbacks: [], retries: [],
+    }))
+    const store = new WebhookStore(file, () => {}, { kind: 'fresh', cwd: dir })
+    store.load()
+    expect(store.hookByName('legacy')).toMatchObject({ runTarget: { kind: 'fresh', cwd: dir }, concurrencyLimit: 1 })
+    const persisted = JSON.parse(readFileSync(file, 'utf8')) as { version: number; eventCursor: number }
+    expect(persisted).toMatchObject({ version: 3, eventCursor: 0 })
   })
 
   it('round-trips hooks and deliveries through disk', () => {
